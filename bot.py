@@ -8,7 +8,7 @@ import os, logging, json, tempfile, requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -24,6 +24,13 @@ TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
 SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID")
 ALLOWED_USERS   = set(os.getenv("ALLOWED_USERS", "").split(","))
+SPREADSHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("📋 Меню"), KeyboardButton("🗓 Таблица"), KeyboardButton("📅 Сегодня")]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 # ── Groq API (прямые запросы) ──────────────────────────────────
 GROQ_HEADERS = {
@@ -283,8 +290,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✍️ Текст — тоже пойму\n\n"
         "📋 /today — задачи на сегодня\n"
         "✅ /done — отметить выполненное\n"
-        "📊 /habits — привычки за день\n\n"
-        "Просто говори — я пойму! 😊")
+        "📊 /habits — привычки за день\n"
+        "🗓 /table — открыть таблицу\n"
+        "📋 /menu — главное меню\n\n"
+        "Просто говори — я пойму! 😊",
+        reply_markup=MAIN_KEYBOARD)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
@@ -306,8 +316,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     user_id = str(update.effective_user.id)
-    text    = update.message.text
+    text    = (update.message.text or "").strip()
     today   = datetime.now().strftime("%d.%m.%Y")
+
+    # Handle persistent keyboard buttons (match by keyword, since some
+    # Telegram clients add/drop emoji variation selectors on the label)
+    if "Меню" in text:
+        await menu_command(update, context)
+        return
+    if "Таблица" in text:
+        await table_command(update, context)
+        return
+    if "Сегодня" in text:
+        await today_tasks(update, context)
+        return
+
     if user_id in user_states and user_states[user_id].get("awaiting_date"):
         user_states[user_id]["date"] = text
         user_states[user_id].pop("awaiting_date")
@@ -328,6 +351,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[user_id]["category"] = category
             parsed = user_states.pop(user_id)
             await save_task(query, parsed, today)
+    elif data == "menu_today":
+        await today_tasks(update, context)
+    elif data == "menu_done":
+        await done_command(update, context)
+    elif data == "menu_habits":
+        await habits_command(update, context)
     elif data.startswith("done_"):
         parts    = data.split("_")
         date_str = parts[1]
@@ -382,10 +411,33 @@ async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {row[1]}: *{row[2]}*\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update): return
+    keyboard = [[InlineKeyboardButton("📊 Открыть таблицу", url=SPREADSHEET_URL)]]
+    await update.message.reply_text(
+        "📊 *Твой планнер в Google Таблицах:*\n\nНажми кнопку ниже чтобы открыть:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown")
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update): return
+    keyboard = [
+        [InlineKeyboardButton("📅 Задачи на сегодня", callback_data="menu_today")],
+        [InlineKeyboardButton("✅ Отметить выполненное", callback_data="menu_done")],
+        [InlineKeyboardButton("📊 Привычки", callback_data="menu_habits")],
+        [InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)],
+    ]
+    await update.message.reply_text(
+        "📋 *Главное меню:*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown")
+
 # ── Main ───────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  start))
+    app.add_handler(CommandHandler("menu",   menu_command))
+    app.add_handler(CommandHandler("table",  table_command))
     app.add_handler(CommandHandler("today",  today_tasks))
     app.add_handler(CommandHandler("done",   done_command))
     app.add_handler(CommandHandler("habits", habits_command))
