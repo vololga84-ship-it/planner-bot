@@ -4,7 +4,7 @@
 Без библиотеки groq — прямые HTTP запросы
 """
 
-import os, logging, json, tempfile, requests
+import os, re, logging, json, tempfile, requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -209,9 +209,13 @@ def delete_entry_from_sheet(date_str, row_num):
     column = day_column(date_str)
     ws.update(f"{column}{row_num}", [[""]])
 
+def _words(text):
+    return set(re.findall(r"\w+", text.lower(), re.UNICODE))
+
 def find_matching_entries(date_str, query):
-    """Найти задачи/привычки за день, похожие на query. Возвращает список
-    (row_num, label, text_для_показа)."""
+    """Найти задачи/привычки за день, похожие на query, по совпадению слов
+    (без учёта эмодзи/пунктуации). Возвращает список записей с наибольшим
+    числом общих слов: (row_num, label, text_для_показа)."""
     candidates = []
     for row_num, row in get_tasks_for_day(date_str):
         candidates.append((row_num, row[0], row[1]))
@@ -219,11 +223,14 @@ def find_matching_entries(date_str, query):
         display = f"{row[1]} — {row[2]}" if row[2] else row[1]
         candidates.append((row_num, row[0], display))
 
-    query_norm = (query or "").strip().lower()
-    if not query_norm:
+    query_words = _words(query or "")
+    if not query_words:
         return []
-    return [c for c in candidates
-            if query_norm in c[2].lower() or c[2].lower() in query_norm]
+    scored = [(len(query_words & _words(c[2])), c) for c in candidates]
+    best = max((s for s, _ in scored), default=0)
+    if best == 0:
+        return []
+    return [c for s, c in scored if s == best]
 
 # ── State ──────────────────────────────────────────────────────
 user_states = {}
