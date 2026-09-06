@@ -59,9 +59,9 @@ def parse_task(text, today):
 {{"type":"task","category":"личное","task":"{text}","date":null,"time":null,"habit_name":null,"habit_value":null,"missing":[]}}
 
 Заполни поля правильно:
-- type: "task" (обычная задача), "habit" (привычка: сон/витамины/прогулка/вода/встала/легла), "note" (заметка)
+- type: "task" (обычная задача), "habit" (привычка: сон/витамины/прогулка/вода/встала/легла), "note" (заметка), "delete" (просьба удалить/убрать/стереть/отменить уже существующую запись, например «удали запись про парикмахера»)
 - category: "работа", "личное" или "дом". Если не указано явно — угадай по контексту (парикмахер/врач/магазин = личное, уборка/готовка = дом, встреча/звонок коллеге = работа)
-- task: краткое описание задачи
+- task: краткое описание задачи. Для type="delete" — только ключевые слова для поиска записи, без слов «удали»/«убери»/«сотри»
 - date: "{today}" если сегодня, "{tomorrow}" если завтра, иначе null
 - time: время в формате ЧЧ:ММ если упомянуто, иначе null
 - habit_name: для привычки выбери одно точное название: "🌙 Легла спать", "☀️ Встала", "😴 Сон (часов)", "💊 Витамины утром", "💊 Витамины вечер", "🚶 Прогулка", "💧 Вода", "📖 Чтение", "😊 Настроение" или "⚡ Энергия"
@@ -202,6 +202,29 @@ def mark_task_done(date_str, row_num):
     value = ws.acell(f"{column}{row_num}").value or ""
     ws.update(f"{column}{row_num}", [["✅ " + value.lstrip("☐✅ ").strip()]])
 
+def delete_entry_from_sheet(date_str, row_num):
+    ws = get_week_sheet(date_str, create=False)
+    if not ws:
+        return
+    column = day_column(date_str)
+    ws.update(f"{column}{row_num}", [[""]])
+
+def find_matching_entries(date_str, query):
+    """Найти задачи/привычки за день, похожие на query. Возвращает список
+    (row_num, label, text_для_показа)."""
+    candidates = []
+    for row_num, row in get_tasks_for_day(date_str):
+        candidates.append((row_num, row[0], row[1]))
+    for row_num, row in get_habits_for_day(date_str):
+        display = f"{row[1]} — {row[2]}" if row[2] else row[1]
+        candidates.append((row_num, row[0], display))
+
+    query_norm = (query or "").strip().lower()
+    if not query_norm:
+        return []
+    return [c for c in candidates
+            if query_norm in c[2].lower() or c[2].lower() in query_norm]
+
 # ── State ──────────────────────────────────────────────────────
 user_states = {}
 
@@ -259,6 +282,27 @@ async def process_text(update, text):
             parse_mode="Markdown")
         return
 
+    if parsed.get("type") == "delete":
+        date_str = parsed.get("date") or today
+        query    = parsed.get("task", "")
+        matches  = find_matching_entries(date_str, query)
+        if not matches:
+            await update.message.reply_text(
+                f"🤔 Не нашла запись «{query}» на {date_str}, чтобы удалить.")
+            return
+        if len(matches) == 1:
+            row_num, _, entry_text = matches[0]
+            delete_entry_from_sheet(date_str, row_num)
+            await update.message.reply_text(f"🗑 Удалила: {entry_text}")
+            return
+        keyboard = [[InlineKeyboardButton(f"🗑 {entry_text[:45]}",
+                     callback_data=f"delpick_{date_str}_{row_num}")]
+                    for row_num, _, entry_text in matches[:8]]
+        await update.message.reply_text(
+            "🤔 Нашла несколько похожих записей. Какую удалить?",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
     if parsed.get("type") in ("task", "note"):
         if "category" in parsed.get("missing", []):
             user_states[user_id] = parsed
@@ -287,7 +331,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я твой личный планнер.\n\n"
         "🎤 Голосовое — запишу задачу\n"
-        "✍️ Текст — тоже пойму\n\n"
+        "✍️ Текст — тоже пойму\n"
+        "🗑 «Удали запись про...» — сотру подходящую запись\n\n"
         "📋 /today — задачи на сегодня\n"
         "✅ /done — отметить выполненное\n"
         "📊 /habits — привычки за день\n"
@@ -363,6 +408,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_num  = int(parts[2])
         mark_task_done(date_str, row_num)
         await query.edit_message_text(query.message.text + "\n\n✅ Готово!")
+    elif data.startswith("delpick_"):
+        parts    = data.split("_")
+        date_str = parts[1]
+        row_num  = int(parts[2])
+        delete_entry_from_sheet(date_str, row_num)
+        await query.edit_message_text("🗑 Запись удалена.")
 
 async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
