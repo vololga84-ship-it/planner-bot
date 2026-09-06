@@ -1,0 +1,5 @@
+python-telegram-bot==20.7
+groq==0.4.2
+gspread==5.12.0
+google-auth==2.27.0
+python-dotenv==1.0.0
