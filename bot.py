@@ -57,16 +57,17 @@ def parse_task(text, today, habit_names):
     prompt = f"""Сегодня {today}. Пользователь сказал: "{text}"
 
 Ответь ТОЛЬКО валидным JSON объектом, без пояснений, без markdown:
-{{"type":"task","category":"личное","task":"{text}","date":null,"time":null,"habit_name":null,"habit_value":null,"missing":[]}}
+{{"type":"task","category":"личное","task":"{text}","date":null,"time":null,"habit_name":null,"habit_value":null,"period":null,"missing":[]}}
 
 Заполни поля правильно:
-- type: "task" (обычная задача), "habit" (привычка: сон/витамины/прогулка/вода/встала/легла), "note" (заметка), "delete" (просьба удалить/убрать/стереть/отменить уже существующую запись, например «удали запись про парикмахера»), "question" (вопрос, комментарий или рассуждение вслух, НЕ задача для записи — например «а почему ты это записал туда, а не в другую табличку»)
+- type: "task" (обычная разовая задача), "habit" (привычка: сон/витамины/прогулка/вода/встала/легла), "note" (заметка), "goal" (цель на месяц или на год, а не разовая задача — например «цель на месяц выучить 50 слов» или «добавь годовую цель — накопить на отпуск»), "delete" (просьба удалить/убрать/стереть/отменить уже существующую запись, например «удали запись про парикмахера»), "question" (вопрос, комментарий или рассуждение вслух, НЕ задача для записи — например «а почему ты это записал туда, а не в другую табличку»)
 - category: "работа", "личное" или "дом". Если не указано явно — угадай по контексту (парикмахер/врач/магазин = личное, уборка/готовка = дом, встреча/звонок коллеге = работа)
-- task: краткое описание задачи. Для type="delete" — только ключевые слова для поиска записи, без слов «удали»/«убери»/«сотри»
+- task: краткое описание задачи или цели. Для type="delete" — только ключевые слова для поиска записи, без слов «удали»/«убери»/«сотри»
 - date: "{today}" если сегодня, "{tomorrow}" если завтра, иначе null
 - time: время в формате ЧЧ:ММ если упомянуто, иначе null
 - habit_name: для привычки выбери одно точное название из списка: {habit_list_str}
 - habit_value: значение привычки без пояснений, например "23:30", "✅", "45", "8"
+- period: для type="goal" — "месяц" или "год" (если не сказано явно, поставь "месяц"), иначе null
 - missing: [] (всегда пустой — угадывай категорию сам)"""
 
     resp = requests.post(
@@ -255,24 +256,76 @@ def _words(text):
     return set(re.findall(r"\w+", text.lower(), re.UNICODE))
 
 def find_matching_entries(date_str, query):
-    """Найти задачи/привычки за день, похожие на query, по совпадению слов
-    (без учёта эмодзи/пунктуации). Возвращает список записей с наибольшим
-    числом общих слов: (row_num, label, text_для_показа)."""
+    """Найти задачи/привычки за день и цели, похожие на query, по совпадению
+    слов (без учёта эмодзи/пунктуации). Возвращает список записей с
+    наибольшим числом общих слов: (kind, row_num, label, text_для_показа).
+    kind — "day" (задача/привычка за конкретный день) или "goal"."""
     candidates = []
     for row_num, row in get_tasks_for_day(date_str):
-        candidates.append((row_num, row[0], row[1]))
+        candidates.append(("day", row_num, row[0], row[1]))
     for row_num, row in get_habits_for_day(date_str):
         display = f"{row[1]} — {row[2]}" if row[2] else row[1]
-        candidates.append((row_num, row[0], display))
+        candidates.append(("day", row_num, row[0], display))
+    for row_num, period, category, goal_text, _, _ in get_goals():
+        candidates.append(("goal", row_num, f"Цель на {period}", goal_text))
 
     query_words = _words(query or "")
     if not query_words:
         return []
-    scored = [(len(query_words & _words(c[2])), c) for c in candidates]
+    scored = [(len(query_words & _words(c[3])), c) for c in candidates]
     best = max((s for s, _ in scored), default=0)
     if best == 0:
         return []
     return [c for s, c in scored if s == best]
+
+# ── Google Sheets: цели (месяц/год) ─────────────────────────────
+GOALS_SHEET = "🎯 Цели"
+GOAL_ROWS = {
+    "месяц": {"работа": (5, 8), "личное": (10, 13), "дом": (15, 18)},
+    "год":   {"работа": (23, 26), "личное": (28, 31), "дом": (33, 36)},
+}
+
+def add_goal(period, category, goal_text, deadline=""):
+    sheet = get_sheet()
+    ws = sheet.worksheet(GOALS_SHEET)
+    start_row, end_row = GOAL_ROWS[period][category]
+    values = ws.get(f"B{start_row}:B{end_row}")
+    for row_num in range(start_row, end_row + 1):
+        offset = row_num - start_row
+        cell = values[offset][0] if offset < len(values) and values[offset] else ""
+        if not cell.strip():
+            ws.update(f"B{row_num}:E{row_num}", [[goal_text, "", deadline, "☐"]])
+            return row_num
+    raise ValueError(f"Все слоты целей на {period} ({category}) заняты.")
+
+def get_goals():
+    """Все непустые цели. Возвращает список
+    (row_num, period, category, goal_text, deadline, status)."""
+    sheet = get_sheet()
+    ws = sheet.worksheet(GOALS_SHEET)
+    goals = []
+    for period, categories in GOAL_ROWS.items():
+        for category, (start_row, end_row) in categories.items():
+            values = ws.get(f"B{start_row}:E{end_row}")
+            for i, row_num in enumerate(range(start_row, end_row + 1)):
+                row = values[i] if i < len(values) else []
+                goal_text = row[0] if len(row) > 0 else ""
+                if not goal_text.strip():
+                    continue
+                deadline = row[2] if len(row) > 2 else ""
+                status   = row[3] if len(row) > 3 else "☐"
+                goals.append((row_num, period, category, goal_text, deadline, status))
+    return goals
+
+def mark_goal_done(row_num):
+    sheet = get_sheet()
+    ws = sheet.worksheet(GOALS_SHEET)
+    ws.update(f"E{row_num}", [["✅"]])
+
+def delete_goal(row_num):
+    sheet = get_sheet()
+    ws = sheet.worksheet(GOALS_SHEET)
+    ws.update(f"B{row_num}:E{row_num}", [["", "", "", ""]])
 
 # ── State ──────────────────────────────────────────────────────
 user_states = {}
@@ -343,19 +396,43 @@ async def process_text(update, text):
         matches  = find_matching_entries(date_str, query)
         if not matches:
             await update.message.reply_text(
-                f"🤔 Не нашла запись «{query}» на {date_str}, чтобы удалить.")
+                f"🤔 Не нашла запись «{query}», чтобы удалить.")
             return
         if len(matches) == 1:
-            row_num, _, entry_text = matches[0]
-            delete_entry_from_sheet(date_str, row_num)
+            kind, row_num, _, entry_text = matches[0]
+            if kind == "goal":
+                delete_goal(row_num)
+            else:
+                delete_entry_from_sheet(date_str, row_num)
             await update.message.reply_text(f"🗑 Удалила: {entry_text}")
             return
         keyboard = [[InlineKeyboardButton(f"🗑 {entry_text[:45]}",
-                     callback_data=f"delpick_{date_str}_{row_num}")]
-                    for row_num, _, entry_text in matches[:8]]
+                     callback_data=f"delpick_{kind}_{date_str}_{row_num}")]
+                    for kind, row_num, _, entry_text in matches[:8]]
         await update.message.reply_text(
             "🤔 Нашла несколько похожих записей. Какую удалить?",
             reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if parsed.get("type") == "goal":
+        category  = parsed.get("category", "личное")
+        period    = parsed.get("period") or "месяц"
+        goal_text = parsed.get("task", "")
+        if period not in GOAL_ROWS:
+            period = "месяц"
+        if category not in GOAL_ROWS[period]:
+            category = "личное"
+        try:
+            add_goal(period, category, goal_text)
+        except Exception:
+            logger.exception("Could not save goal")
+            await update.message.reply_text(
+                f"❌ Не удалось записать цель — похоже, все слоты на {period} в этой категории заняты.")
+            return
+        cat_emoji = {"работа": "💼", "личное": "👤", "дом": "🏠"}.get(category, "📌")
+        await update.message.reply_text(
+            f"🎯 Цель на {period} записана!\n\n{cat_emoji} *{category.capitalize()}*\n📌 {goal_text}",
+            parse_mode="Markdown")
         return
 
     if parsed.get("type") in ("task", "note"):
@@ -391,6 +468,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 /today — задачи на сегодня\n"
         "✅ /done — отметить выполненное\n"
         "📊 /habits — привычки за день\n"
+        "🎯 /goals — цели на месяц/год\n"
         "🗓 /table — открыть таблицу\n"
         "📋 /menu — главное меню\n\n"
         "Просто говори — я пойму! 😊",
@@ -457,17 +535,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await done_command(update, context)
     elif data == "menu_habits":
         await habits_command(update, context)
+    elif data == "menu_goals":
+        await goals_command(update, context)
     elif data.startswith("done_"):
         parts    = data.split("_")
         date_str = parts[1]
         row_num  = int(parts[2])
         mark_task_done(date_str, row_num)
         await query.edit_message_text(query.message.text + "\n\n✅ Готово!")
+    elif data.startswith("goaldone_"):
+        row_num = int(data.split("_")[1])
+        mark_goal_done(row_num)
+        await query.edit_message_text(query.message.text + "\n\n✅ Цель выполнена!")
     elif data.startswith("delpick_"):
         parts    = data.split("_")
-        date_str = parts[1]
-        row_num  = int(parts[2])
-        delete_entry_from_sheet(date_str, row_num)
+        kind     = parts[1]
+        date_str = parts[2]
+        row_num  = int(parts[3])
+        if kind == "goal":
+            delete_goal(row_num)
+        else:
+            delete_entry_from_sheet(date_str, row_num)
         await query.edit_message_text("🗑 Запись удалена.")
 
 async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -517,6 +605,32 @@ async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {row[1]}: *{row[2]}*\n"
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
+async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update): return
+    goals = get_goals()
+    if not goals:
+        await update.effective_message.reply_text(
+            "🎯 Целей пока нет.\n\n"
+            "Скажи: «Цель на месяц — выучить английский, личное»")
+        return
+    cat_emoji = {"работа": "💼", "личное": "👤", "дом": "🏠"}
+    text = "🎯 *Твои цели:*\n\n"
+    for period in ("месяц", "год"):
+        period_goals = [g for g in goals if g[1] == period]
+        if not period_goals:
+            continue
+        text += f"— *На {period}* —\n"
+        for row_num, _, category, goal_text, deadline, status in period_goals:
+            deadline_info = f" _(до {deadline})_" if deadline else ""
+            text += f"{status} {cat_emoji.get(category, '📌')} {goal_text}{deadline_info}\n"
+        text += "\n"
+    active = [g for g in goals if g[5] != "✅"]
+    keyboard = [[InlineKeyboardButton(f"✅ {g[3][:35]}", callback_data=f"goaldone_{g[0]}")]
+                for g in active[:8]]
+    await update.effective_message.reply_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
 async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     keyboard = [[InlineKeyboardButton("📊 Открыть таблицу", url=SPREADSHEET_URL)]]
@@ -531,6 +645,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📅 Задачи на сегодня", callback_data="menu_today")],
         [InlineKeyboardButton("✅ Отметить выполненное", callback_data="menu_done")],
         [InlineKeyboardButton("📊 Привычки", callback_data="menu_habits")],
+        [InlineKeyboardButton("🎯 Цели", callback_data="menu_goals")],
         [InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)],
     ]
     await update.message.reply_text(
@@ -547,6 +662,7 @@ def main():
     app.add_handler(CommandHandler("today",  today_tasks))
     app.add_handler(CommandHandler("done",   done_command))
     app.add_handler(CommandHandler("habits", habits_command))
+    app.add_handler(CommandHandler("goals",  goals_command))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
