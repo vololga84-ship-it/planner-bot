@@ -67,6 +67,9 @@ def parse_task(text, today):
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 300,
             "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "none",
+            "reasoning_format": "hidden",
         },
         timeout=30,
     )
