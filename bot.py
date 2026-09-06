@@ -48,13 +48,24 @@ def owner_for(update):
 def _words(text):
     return set(re.findall(r"\w+", text.lower(), re.UNICODE))
 
+def _ru_stem(word):
+    """Грубый стемминг: у русских имён на -а/-я падежные окончания почти
+    всегда меняют только последнюю букву (мама/маму/мамы/маме, оля/олю/оле)."""
+    return word[:-1] if len(word) > 2 else word
+
 def resolve_owner_name(spoken):
-    """Сопоставить произнесённое имя с одним из известных участников."""
+    """Сопоставить произнесённое имя (в любом падеже) с одним из известных
+    участников."""
     if not spoken:
         return None
     spoken_words = _words(spoken)
     for name in ALL_OWNERS:
         if _words(name) & spoken_words:
+            return name
+    # запасной вариант — сравнить по основе слова (без падежного окончания)
+    for name in ALL_OWNERS:
+        name_stem = _ru_stem(name.lower())
+        if any(_ru_stem(w) == name_stem for w in spoken_words):
             return name
     return None
 
