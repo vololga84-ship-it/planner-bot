@@ -57,6 +57,8 @@ def parse_task(text, today):
 - task: краткое описание задачи
 - date: "{today}" если сегодня, "{tomorrow}" если завтра, иначе null
 - time: время в формате ЧЧ:ММ если упомянуто, иначе null
+- habit_name: для привычки выбери одно точное название: "🌙 Легла спать", "☀️ Встала", "😴 Сон (часов)", "💊 Витамины утром", "💊 Витамины вечер", "🚶 Прогулка", "💧 Вода", "📖 Чтение", "😊 Настроение" или "⚡ Энергия"
+- habit_value: значение привычки без пояснений, например "23:30", "✅", "45", "8"
 - missing: [] (всегда пустой — угадывай категорию сам)"""
 
     resp = requests.post(
@@ -84,7 +86,19 @@ def parse_task(text, today):
         raw = raw[start:end]
     return json.loads(raw)
 
-# ── Google Sheets ──────────────────────────────────────────────
+# ── Google Sheets: недельный шаблон ─────────────────────────────
+TEMPLATE_SHEET = "📅 Неделя"
+CATEGORY_ROWS = {
+    "работа": (5, 10, "💼 РАБОТА"),
+    "личное": (12, 17, "👤 ЛИЧНОЕ"),
+    "дом": (19, 24, "🏠 ДОМ"),
+}
+HABIT_ROWS = {
+    "🌙 Легла спать": 26, "☀️ Встала": 27, "😴 Сон (часов)": 28,
+    "💊 Витамины утром": 29, "💊 Витамины вечер": 30, "🚶 Прогулка": 31,
+    "💧 Вода": 32, "📖 Чтение": 33, "😊 Настроение": 34, "⚡ Энергия": 35,
+}
+
 def get_sheet():
     creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
     scopes = ["https://spreadsheets.google.com/feeds",
@@ -93,35 +107,93 @@ def get_sheet():
     gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID)
 
-def find_or_create_day_sheet(sheet, date_str):
+def week_start(date_str):
+    day = datetime.strptime(date_str, "%d.%m.%Y")
+    return day - timedelta(days=day.weekday())
+
+def week_sheet_name(date_str):
+    monday = week_start(date_str)
+    sunday = monday + timedelta(days=6)
+    return f"📅 Неделя {monday:%d.%m}–{sunday:%d.%m}"
+
+def get_week_sheet(date_str, create=False):
+    sheet = get_sheet()
+    title = week_sheet_name(date_str)
     try:
-        return sheet.worksheet(date_str)
+        return sheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=date_str, rows=100, cols=5)
-        ws.update("A1:E1", [["Категория", "Задача", "Время", "Выполнено", "Тип"]])
-        ws.format("A1:E1", {"textFormat": {"bold": True}})
+        if not create:
+            return None
+        template = sheet.worksheet(TEMPLATE_SHEET)
+        sheet.batch_update({"requests": [{"duplicateSheet": {
+            "sourceSheetId": template.id, "newSheetName": title
+        }}]})
+        ws = sheet.worksheet(title)
+        monday = week_start(date_str)
+        ws.update("B3:H3", [[(monday + timedelta(days=i)).strftime("%d.%m") for i in range(7)]])
+        ws.batch_clear(["B5:H10", "B12:H17", "B19:H24", "B26:H35"])
         return ws
 
+def day_column(date_str):
+    return chr(ord("B") + datetime.strptime(date_str, "%d.%m.%Y").weekday())
+
 def add_task_to_sheet(category, task, time_str, date_str, row_type="task"):
-    sheet = get_sheet()
-    ws = find_or_create_day_sheet(sheet, date_str)
-    next_row = len(ws.get_all_values()) + 1
-    ws.update(f"A{next_row}:E{next_row}", [[category, task, time_str, "☐", row_type]])
-    return next_row
+    ws = get_week_sheet(date_str, create=True)
+    column = day_column(date_str)
+    if row_type == "habit":
+        row = HABIT_ROWS.get(task)
+        if not row:
+            raise ValueError(f"Неизвестная привычка: {task}")
+        ws.update(f"{column}{row}", [[time_str]])
+        return row
+
+    start_row, end_row, _ = CATEGORY_ROWS.get(category, CATEGORY_ROWS["личное"])
+    values = ws.get(f"{column}{start_row}:{column}{end_row}")
+    for row_num in range(start_row, end_row + 1):
+        offset = row_num - start_row
+        if offset >= len(values) or not values[offset] or not values[offset][0]:
+            task_text = f"☐ {task}" + (f" — {time_str}" if time_str else "")
+            ws.update(f"{column}{row_num}", [[task_text]])
+            return row_num
+    raise ValueError("В этой категории на день уже шесть задач.")
 
 def get_tasks_for_day(date_str):
     try:
-        sheet = get_sheet()
-        ws = sheet.worksheet(date_str)
-        rows = ws.get_all_values()
-        return [(i+2, row) for i, row in enumerate(rows[1:]) if len(row) >= 2 and row[1]]
+        ws = get_week_sheet(date_str, create=False)
+        if not ws:
+            return []
+        column = day_column(date_str)
+        tasks = []
+        for category, (start_row, end_row, label) in CATEGORY_ROWS.items():
+            values = ws.get(f"{column}{start_row}:{column}{end_row}")
+            for row_num in range(start_row, end_row + 1):
+                offset = row_num - start_row
+                value = values[offset][0] if offset < len(values) and values[offset] else ""
+                if value:
+                    status = "✅" if value.startswith("✅") else "☐"
+                    tasks.append((row_num, [label, value.lstrip("☐✅ ").strip(), "", status, "task"]))
+        return tasks
     except Exception:
+        logger.exception("Could not read weekly tasks")
         return []
 
+def get_habits_for_day(date_str):
+    ws = get_week_sheet(date_str, create=False)
+    if not ws:
+        return []
+    column = day_column(date_str)
+    values = ws.get(f"A26:{column}35")
+    day_index = ord(column) - ord("A")
+    return [(26 + i, ["⏰ ПРИВЫЧКА", row[0], row[day_index], "", "habit"])
+            for i, row in enumerate(values) if len(row) > day_index and row[day_index]]
+
 def mark_task_done(date_str, row_num):
-    sheet = get_sheet()
-    ws = sheet.worksheet(date_str)
-    ws.update(f"D{row_num}", [["✅"]])
+    ws = get_week_sheet(date_str, create=False)
+    if not ws:
+        return
+    column = day_column(date_str)
+    value = ws.acell(f"{column}{row_num}").value or ""
+    ws.update(f"{column}{row_num}", [["✅ " + value.lstrip("☐✅ ").strip()]])
 
 # ── State ──────────────────────────────────────────────────────
 user_states = {}
@@ -136,7 +208,13 @@ async def save_task(update_or_query, parsed, default_date):
     task      = parsed.get("task", "")
     time_str  = parsed.get("time") or ""
     cat_emoji = {"работа": "💼", "личное": "👤", "дом": "🏠"}.get(category, "📌")
-    add_task_to_sheet(f"{cat_emoji} {category.upper()}", task, time_str, date_str)
+    try:
+        add_task_to_sheet(category, task, time_str, date_str)
+    except Exception:
+        logger.exception("Could not save task to weekly planner")
+        await update_or_query.message.reply_text(
+            "❌ Не удалось записать задачу в недельный планнер. Попробуй ещё раз.")
+        return
     time_info = f" в {time_str}" if time_str else ""
     text = (f"✅ Записала!\n\n{cat_emoji} *{category.capitalize()}*\n"
             f"📌 {task}{time_info}\n📅 {date_str}")
@@ -161,8 +239,14 @@ async def process_text(update, text):
 
     if parsed.get("type") == "habit":
         date_str = parsed.get("date") or today
-        add_task_to_sheet("⏰ ПРИВЫЧКА", parsed.get("habit_name",""),
-                          parsed.get("habit_value",""), date_str, "habit")
+        try:
+            add_task_to_sheet("", parsed.get("habit_name", ""),
+                              parsed.get("habit_value", ""), date_str, "habit")
+        except Exception:
+            logger.exception("Could not save habit to weekly planner")
+            await update.message.reply_text(
+                "❌ Не смогла сопоставить привычку с планнером. Попробуй назвать её иначе.")
+            return
         await update.message.reply_text(
             f"✅ Привычка: *{parsed.get('habit_name','')}* — {parsed.get('habit_value','')}",
             parse_mode="Markdown")
@@ -286,8 +370,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     today  = datetime.now().strftime("%d.%m.%Y")
-    tasks  = get_tasks_for_day(today)
-    habits = [(rn, row) for rn, row in tasks if len(row) >= 5 and row[4] == "habit"]
+    habits = get_habits_for_day(today)
     if not habits:
         await update.message.reply_text(
             f"📊 *Привычки на {today}*\n\nНичего не записано.\n\n"
