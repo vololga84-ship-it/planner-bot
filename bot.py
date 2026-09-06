@@ -4,7 +4,7 @@
 Без библиотеки groq — прямые HTTP запросы
 """
 
-import os, re, logging, json, tempfile, requests
+import os, re, time, logging, json, tempfile, requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -50,9 +50,10 @@ def transcribe_voice(file_path):
     resp.raise_for_status()
     return resp.text.strip()
 
-def parse_task(text, today):
+def parse_task(text, today, habit_names):
     """Понять задачу через Groq LLaMA."""
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+    habit_list_str = ", ".join(f'"{name}"' for name in habit_names)
     prompt = f"""Сегодня {today}. Пользователь сказал: "{text}"
 
 Ответь ТОЛЬКО валидным JSON объектом, без пояснений, без markdown:
@@ -64,7 +65,7 @@ def parse_task(text, today):
 - task: краткое описание задачи. Для type="delete" — только ключевые слова для поиска записи, без слов «удали»/«убери»/«сотри»
 - date: "{today}" если сегодня, "{tomorrow}" если завтра, иначе null
 - time: время в формате ЧЧ:ММ если упомянуто, иначе null
-- habit_name: для привычки выбери одно точное название: "🌙 Легла спать", "☀️ Встала", "😴 Сон (часов)", "💊 Витамины утром", "💊 Витамины вечер", "🚶 Прогулка", "💧 Вода", "📖 Чтение", "😊 Настроение" или "⚡ Энергия"
+- habit_name: для привычки выбери одно точное название из списка: {habit_list_str}
 - habit_value: значение привычки без пояснений, например "23:30", "✅", "45", "8"
 - missing: [] (всегда пустой — угадывай категорию сам)"""
 
@@ -100,11 +101,48 @@ CATEGORY_ROWS = {
     "личное": (12, 17, "👤 ЛИЧНОЕ"),
     "дом": (19, 24, "🏠 ДОМ"),
 }
-HABIT_ROWS = {
-    "🌙 Легла спать": 26, "☀️ Встала": 27, "😴 Сон (часов)": 28,
-    "💊 Витамины утром": 29, "💊 Витамины вечер": 30, "🚶 Прогулка": 31,
-    "💧 Вода": 32, "📖 Чтение": 33, "😊 Настроение": 34, "⚡ Энергия": 35,
-}
+HABITS_SHEET     = "⚙️ Мои привычки"
+HABIT_START_ROW  = 26
+HABIT_MAX_ROWS   = 10  # столько строк отведено под привычки в шаблоне (26-35)
+HABIT_CACHE_TTL  = 300  # секунд
+DEFAULT_HABITS = [
+    "🌙 Легла спать", "☀️ Встала", "😴 Сон (часов)",
+    "💊 Витамины утром", "💊 Витамины вечер", "🚶 Прогулка",
+    "💧 Вода", "📖 Чтение", "😊 Настроение", "⚡ Энергия",
+]
+_habit_cache = {"names": None, "ts": 0}
+
+def get_habit_list():
+    """Список привычек из листа настроек (в порядке строк), не больше
+    HABIT_MAX_ROWS штук — столько строк физически есть в шаблоне недели.
+    Кэшируется на HABIT_CACHE_TTL секунд, чтобы не дёргать Sheets на каждое
+    сообщение."""
+    now = time.time()
+    if _habit_cache["names"] is not None and now - _habit_cache["ts"] < HABIT_CACHE_TTL:
+        return _habit_cache["names"]
+    try:
+        sheet = get_sheet()
+        ws = sheet.worksheet(HABITS_SHEET)
+        values = ws.get(f"A3:A{2 + HABIT_MAX_ROWS + 10}")
+        names = []
+        for row in values:
+            name = (row[0] if row else "").strip()
+            if not name or name.startswith("("):
+                continue
+            names.append(name)
+            if len(names) >= HABIT_MAX_ROWS:
+                break
+        if not names:
+            names = list(DEFAULT_HABITS)
+    except Exception:
+        logger.exception("Could not read habits settings sheet")
+        names = _habit_cache["names"] or list(DEFAULT_HABITS)
+    _habit_cache["names"] = names
+    _habit_cache["ts"] = now
+    return names
+
+def habit_row_map():
+    return {name: HABIT_START_ROW + i for i, name in enumerate(get_habit_list())}
 
 def get_sheet():
     creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
@@ -139,6 +177,10 @@ def get_week_sheet(date_str, create=False):
         monday = week_start(date_str)
         ws.update("B3:H3", [[(monday + timedelta(days=i)).strftime("%d.%m") for i in range(7)]])
         ws.batch_clear(["B5:H10", "B12:H17", "B19:H24", "B26:H35"])
+        habit_names = get_habit_list()
+        labels = [[name] for name in habit_names]
+        labels += [[""]] * (HABIT_MAX_ROWS - len(labels))
+        ws.update(f"A{HABIT_START_ROW}:A{HABIT_START_ROW + HABIT_MAX_ROWS - 1}", labels)
         return ws
 
 def day_column(date_str):
@@ -148,7 +190,7 @@ def add_task_to_sheet(category, task, time_str, date_str, row_type="task"):
     ws = get_week_sheet(date_str, create=True)
     column = day_column(date_str)
     if row_type == "habit":
-        row = HABIT_ROWS.get(task)
+        row = habit_row_map().get(task)
         if not row:
             raise ValueError(f"Неизвестная привычка: {task}")
         ws.update(f"{column}{row}", [[time_str]])
@@ -265,7 +307,7 @@ async def process_text(update, text):
     user_id = str(update.effective_user.id)
     today   = datetime.now().strftime("%d.%m.%Y")
     try:
-        parsed = parse_task(text, today)
+        parsed = parse_task(text, today, get_habit_list())
     except Exception:
         logger.exception("Task parsing failed")
         await update.message.reply_text(
