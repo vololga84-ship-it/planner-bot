@@ -369,7 +369,7 @@ async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().strftime("%d.%m.%Y")
     tasks = get_tasks_for_day(today)
     if not tasks:
-        await update.message.reply_text(f"📅 На {today} задач нет.\n\nНаговори что-нибудь! 🎤")
+        await update.effective_message.reply_text(f"📅 На {today} задач нет.\n\nНаговори что-нибудь! 🎤")
         return
     text = f"📅 *Задачи на {today}:*\n\n"
     for _, row in tasks:
@@ -378,7 +378,7 @@ async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t         = row[2] if len(row) > 2 and row[2] else ""
         time_info = f" _{t}_" if t else ""
         text += f"{status} {row[1]}{time_info}\n   {row[0]}\n\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
@@ -387,11 +387,11 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
              if (len(row) < 5 or row[4] != "habit") and
                 (len(row) < 4 or row[3] != "✅")]
     if not tasks:
-        await update.message.reply_text("🎉 Все задачи выполнены!")
+        await update.effective_message.reply_text("🎉 Все задачи выполнены!")
         return
     keyboard = [[InlineKeyboardButton(f"☐ {row[1][:45]}",
                  callback_data=f"done_{today}_{rn}")] for rn, row in tasks if row[1]]
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "✅ *Что выполнено?*",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown")
@@ -401,7 +401,7 @@ async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today  = datetime.now().strftime("%d.%m.%Y")
     habits = get_habits_for_day(today)
     if not habits:
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             f"📊 *Привычки на {today}*\n\nНичего не записано.\n\n"
             "Скажи голосом: «Встала в 7:30» или «Витамины утром приняла» 🎤",
             parse_mode="Markdown")
@@ -409,7 +409,7 @@ async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"📊 *Привычки на {today}:*\n\n"
     for _, row in habits:
         text += f"• {row[1]}: *{row[2]}*\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
