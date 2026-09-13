@@ -773,25 +773,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Перешли его тому, кто настраивает бота, чтобы получить доступ.",
             parse_mode="Markdown")
         return
-    owner = owner_for(update)
-    idea_line = "💡 «Идеи для постов» — включит запись идей для постов\n" if owner in BLOG_OWNERS else ""
+    owner   = owner_for(update)
+    user_id = str(update.effective_user.id)
+    # /start — ещё и способ выбраться, если бот завис в каком-то режиме
+    # записи (кнопки "⬅️ Выйти" не видно) — сбрасываем всё для этого
+    # пользователя и показываем обычную клавиатуру заново.
+    post_idea_mode_users.discard(user_id)
+    general_notes_mode_users.discard(user_id)
+    user_states.pop(user_id, None)
+    pending_health.pop(user_id, None)
     await update.message.reply_text(
         f"👋 Привет, {display_name_for(update)}! Я твой личный планнер.\n\n"
-        "🎤 Голосовое — запишу задачу\n"
-        "✍️ Текст — тоже пойму\n"
-        "📸 Скриншот — из «Здоровья» запишу сон и шаги в привычки, "
-        "любой другой сохраню как заметку\n"
-        "⏰ Напомню за час и за сутки до любой задачи с указанным временем\n"
-        "🗑 «Удали запись про...» — сотру подходящую запись\n"
-        f"{idea_line}"
-        "📝 «Заметки» — включит запись сумбура на что угодно (план, письмо и т.д.)\n\n"
-        "📋 /today — задачи на сегодня\n"
-        "✅ /done — отметить выполненное\n"
-        "📊 /habits — привычки за день\n"
-        "🎯 /goals — цели на месяц/год\n"
-        "🗓 /table — открыть таблицу\n"
-        "📋 /menu — главное меню\n\n"
-        "Просто говори — я пойму! 😊",
+        "Говори или пиши — разберу, что это: задача, привычка, цель или заметка. "
+        "Для остального — кнопки внизу.\n\n"
+        "♻️ Если что-то зависнет или пойдёт не так — пришли /start ещё раз, всё сброшу.",
         reply_markup=main_keyboard_for(owner))
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
