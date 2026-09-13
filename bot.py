@@ -4,7 +4,7 @@
 Без библиотеки groq — прямые HTTP запросы
 """
 
-import os, re, time, logging, json, tempfile, base64, requests
+import os, re, time, logging, json, tempfile, base64, asyncio, requests
 from datetime import datetime, timedelta, timezone, time as dt_time
 from dotenv import load_dotenv
 
@@ -15,6 +15,7 @@ from telegram.ext import (
 )
 import gspread
 from google.oauth2.service_account import Credentials
+from aiohttp import web
 
 load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -1452,8 +1453,427 @@ async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception(f"Вечерний чек-лист: не удалось отправить {owner}")
 
+# ── Веб-дашборд (свой сервер на Railway, не claude.ai Artifact) ──
+# Раньше дашборд публиковался как Artifact на claude.ai — оказалось,
+# что для просмотра нужен логин в аккаунт Claude, который иногда
+# уходит на модерацию ("account on hold"), плюс сама страница
+# обновлялась только по запросу в чате. Здесь то же самое, но отдаётся
+# прямо с сервера бота: свежие данные, без логина, без claude.ai.
+OWNER_DASHBOARD_STYLE = {
+    "Оля": {"accent": "#1F7A6C", "accent_bg": "#E4F1EE", "accent_dark": "#4FBBA4", "accent_bg_dark": "#1D3530"},
+    "Мама": {"accent": "#B8722E", "accent_bg": "#F6ECDD", "accent_dark": "#E0A45E", "accent_bg_dark": "#3A2E1C"},
+}
+DEFAULT_DASHBOARD_STYLE = {"accent": "#3B6EA8", "accent_bg": "#E4EBF6", "accent_dark": "#6FA0DE", "accent_bg_dark": "#1E2C40"}
+
+# token в конце ссылки DASHBOARD_URLS -> владелец (никакой отдельной
+# переменной не нужно: ссылка вида .../d/<token> уже содержит его)
+DASHBOARD_TOKEN_TO_OWNER = {url.rstrip("/").rsplit("/", 1)[-1]: owner for owner, url in DASHBOARD_URLS.items()}
+DASHBOARD_CACHE = {}  # owner -> готовый HTML
+
+def display_name_for_owner(owner):
+    for uid, name in USER_NAMES.items():
+        if name == owner:
+            return DISPLAY_NAMES.get(uid, owner)
+    return owner
+
+def build_dashboard_data(owner):
+    """Синхронно (gspread) собирает те же данные, что раньше собирались
+    вручную для Artifact: задачи на неделю, привычки, цели, очередь
+    заметок/идей. Вызывать через asyncio.to_thread — блокирующий I/O."""
+    today_dt   = datetime.now()
+    today_str  = today_dt.strftime("%d.%m.%Y")
+    monday     = week_start(today_str)
+    week_dates = [(monday + timedelta(days=i)).strftime("%d.%m.%Y") for i in range(7)]
+    weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+    sheet      = get_sheet()
+    habit_list = get_habit_list()
+    week   = {d: [] for d in week_dates}
+    habits = {name: {} for name in habit_list}
+    goals  = []
+
+    try:
+        ws = sheet.worksheet(week_sheet_name(today_str, owner))
+        for d in week_dates:
+            column = day_column(d)
+            values = ws.get(f"{column}5:{column}24")
+            day_tasks = []
+            for category, (start_row, end_row, label) in CATEGORY_ROWS.items():
+                for row_num in range(start_row, end_row + 1):
+                    offset = row_num - 5
+                    value = values[offset][0] if offset < len(values) and values[offset] else ""
+                    if value:
+                        status = "✅" if value.startswith("✅") else "☐"
+                        day_tasks.append({"category": label, "text": value.lstrip("☐✅ ").strip(), "status": status})
+            week[d] = day_tasks
+        habit_values = ws.get(f"A{HABIT_START_ROW}:H{HABIT_START_ROW + HABIT_MAX_ROWS - 1}")
+        for i, name in enumerate(habit_list):
+            row = habit_values[i] if i < len(habit_values) else []
+            for j, d in enumerate(week_dates):
+                val = row[1 + j] if 1 + j < len(row) else ""
+                if val:
+                    habits[name][d] = val
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    for row_num, period, category, goal_text, deadline, status in get_goals(owner):
+        goals.append({"period": period, "category": category, "text": goal_text, "deadline": deadline, "status": status})
+
+    def read_log(sheet_title):
+        out = []
+        try:
+            ws2 = sheet.worksheet(sheet_title)
+        except gspread.exceptions.WorksheetNotFound:
+            return out
+        for row in ws2.get_all_values()[1:]:
+            date, time_str, row_owner, text, status = (row + [""] * 5)[:5]
+            if row_owner == owner and status.strip() == "новая" and text.strip():
+                out.append({"date": date, "time": time_str, "text": text})
+        return out
+
+    return {
+        "today": today_str, "week_dates": week_dates, "weekday_names": weekday_names,
+        "snapshot_at": today_dt.strftime("%d.%m.%Y, %H:%M"),
+        "week": week, "habits": habits, "goals": goals,
+        "notes": read_log(NOTES_SHEET), "ideas": read_log(IDEAS_SHEET),
+    }
+
+DASHBOARD_PAGE_TEMPLATE = """<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@@TITLE@@</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #EEF0F2; --surface: #FFFFFF; --ink: #1B2430; --ink-muted: #626B79; --ink-faint: #9AA2AE;
+    --line: #DBDFE4; --accent: @@ACCENT@@; --accent-bg: @@ACCENT_BG@@; --today: #C1502E; --done: #9AA2AE;
+    --shadow: 0 1px 2px rgba(27,36,48,.06), 0 8px 24px rgba(27,36,48,.05);
+    --font-display: 'Fraunces', Georgia, serif;
+    --font-body: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14181F; --surface: #1B212B; --ink: #EDEFF2; --ink-muted: #9AA4B2; --ink-faint: #6B7482;
+      --line: #2A313C; --accent: @@ACCENT_DARK@@; --accent-bg: @@ACCENT_BG_DARK@@; --today: #E07A54; --done: #6B7482;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14181F; --surface: #1B212B; --ink: #EDEFF2; --ink-muted: #9AA4B2; --ink-faint: #6B7482;
+    --line: #2A313C; --accent: @@ACCENT_DARK@@; --accent-bg: @@ACCENT_BG_DARK@@; --today: #E07A54; --done: #6B7482;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-body); padding: 28px 20px 48px; }
+  .wrap { max-width: 640px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+  .eyebrow { font-family: var(--font-mono); font-size: 11px; letter-spacing: .12em; color: var(--ink-faint); text-transform: uppercase; }
+  h1 { font-family: var(--font-display); font-weight: 600; font-size: clamp(26px, 5vw, 34px); margin: 4px 0 6px; text-wrap: balance; }
+  .meta { font-size: 13px; color: var(--ink-muted); margin: 0; }
+  .meta a { color: var(--accent); text-decoration: none; font-weight: 500; }
+  .meta a:hover { text-decoration: underline; }
+  .card { background: var(--surface); border-radius: 14px; box-shadow: var(--shadow); position: relative; padding: 22px 22px 26px 30px; overflow: hidden; }
+  .card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 14px; background-image: radial-gradient(circle, var(--bg) 2.5px, transparent 2.6px); background-size: 14px 22px; background-position: 0 6px; border-right: 1px dashed var(--line); }
+  .block-title { font-family: var(--font-display); font-weight: 600; font-size: 18px; margin: 0 0 14px; display: flex; align-items: baseline; gap: 8px; }
+  .block-title .hint { font-family: var(--font-body); font-weight: 400; font-size: 12px; color: var(--ink-faint); }
+  nav.week-strip { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--line); }
+  .day-tab { font-family: var(--font-body); background: none; border: none; border-bottom: 2px solid transparent; border-radius: 8px 8px 0 0; padding: 8px 10px 10px; min-width: 52px; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 3px; color: var(--ink-muted); }
+  .day-tab:hover { background: var(--bg); }
+  .day-tab .dow { font-family: var(--font-mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+  .day-tab .dnum { font-family: var(--font-display); font-weight: 600; font-size: 18px; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .day-tab .count { font-family: var(--font-mono); font-size: 10px; color: var(--ink-faint); min-height: 12px; }
+  .day-tab[aria-selected="true"] { border-bottom-color: var(--today); background: var(--bg); }
+  .day-tab[aria-selected="true"] .dnum { color: var(--today); }
+  .day-tab.is-today .dow { color: var(--today); }
+  .group { margin-bottom: 16px; }
+  .group:last-child { margin-bottom: 0; }
+  .group-label { font-family: var(--font-mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--accent); background: var(--accent-bg); display: inline-block; padding: 2px 8px; border-radius: 5px; margin-bottom: 8px; }
+  ul.tasks { list-style: none; margin: 0; padding: 0; }
+  ul.tasks li { display: flex; gap: 8px; padding: 7px 0; border-top: 1px solid var(--line); font-size: 14.5px; line-height: 1.45; overflow-wrap: anywhere; }
+  ul.tasks li:first-child { border-top: none; }
+  ul.tasks li .box { font-family: var(--font-mono); flex-shrink: 0; color: var(--ink-faint); }
+  ul.tasks li.done { color: var(--done); text-decoration: line-through; }
+  ul.tasks li.done .box { color: var(--done); }
+  .empty { color: var(--ink-faint); font-size: 13.5px; font-style: italic; padding: 6px 0; }
+  .habit-scroll { overflow-x: auto; }
+  table.habit-table { border-collapse: collapse; width: 100%; min-width: 480px; font-size: 13px; }
+  table.habit-table th, table.habit-table td { text-align: center; padding: 7px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  table.habit-table th { font-family: var(--font-mono); font-weight: 500; color: var(--ink-faint); font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; }
+  table.habit-table td:first-child, table.habit-table th:first-child { text-align: left; font-family: var(--font-body); color: var(--ink); white-space: nowrap; padding-right: 14px; }
+  table.habit-table td.today-col, table.habit-table th.today-col { background: var(--accent-bg); border-radius: 4px; }
+  table.habit-table td.val { color: var(--ink-muted); font-family: var(--font-mono); font-size: 12px; }
+  table.habit-table td.val.filled { color: var(--ink); }
+  table.habit-table td.dash { color: var(--ink-faint); }
+  .goal-group { margin-bottom: 14px; }
+  .goal-group:last-child { margin-bottom: 0; }
+  .goal-period { font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); margin: 18px 0 8px; }
+  .goal-period:first-child { margin-top: 0; }
+  ul.goals { list-style: none; margin: 0 0 10px; padding: 0; }
+  ul.goals li { display: flex; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); font-size: 14.5px; line-height: 1.4; }
+  ul.goals li:first-child { border-top: none; }
+  ul.goals li .box { font-family: var(--font-mono); flex-shrink: 0; color: var(--ink-faint); }
+  ul.goals li .deadline { color: var(--ink-faint); font-size: 12px; white-space: nowrap; }
+  ul.goals li.done { color: var(--done); text-decoration: line-through; }
+  .queue-item { padding: 10px 0; border-top: 1px solid var(--line); }
+  .queue-item:first-child { border-top: none; }
+  .queue-item .qmeta { font-family: var(--font-mono); font-size: 11px; color: var(--ink-faint); margin-bottom: 3px; }
+  .queue-item .qtext { font-size: 14px; line-height: 1.45; color: var(--ink); }
+  footer { font-size: 12px; color: var(--ink-faint); text-align: center; }
+</style></head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">@@EYEBROW@@</div>
+    <h1 id="page-title">Неделя</h1>
+    <p class="meta" id="snapshot-meta"></p>
+  </header>
+  <div class="card">
+    <h2 class="block-title">📋 Задачи</h2>
+    <nav class="week-strip" id="week-strip" role="tablist" aria-label="Дни недели"></nav>
+    <div id="content"></div>
+  </div>
+  <div class="card" id="habits-card">
+    <h2 class="block-title">😴 Привычки недели</h2>
+    <div class="habit-scroll"><table class="habit-table" id="habit-table"></table></div>
+  </div>
+  <div class="card" id="goals-card">
+    <h2 class="block-title">🎯 Цели</h2>
+    <div id="goals-content"></div>
+  </div>
+  <div class="card" id="queue-card" hidden>
+    <h2 class="block-title">📥 В очереди на обработку <span class="hint">заметки и идеи для постов</span></h2>
+    <div id="queue-content"></div>
+  </div>
+  <footer>Только твои данные, обновляется сама каждые несколько минут — <a href="?refresh=1">🔄 обновить сейчас</a></footer>
+</div>
+<script type="application/json" id="planner-data">@@DATA_JSON@@</script>
+<script>
+(function () {
+  var data = JSON.parse(document.getElementById('planner-data').textContent);
+  var CATEGORY_ORDER = ["💼 РАБОТА", "👤 ЛИЧНОЕ", "🏠 ДОМ"];
+  var monday = data.week_dates[0].slice(0, 5);
+  var sunday = data.week_dates[6].slice(0, 5);
+  document.getElementById('page-title').textContent = 'Неделя, ' + monday + '–' + sunday;
+  document.getElementById('snapshot-meta').textContent = 'Обновлено: ' + (data.snapshot_at || data.today);
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]; });
+  }
+
+  var strip = document.getElementById('week-strip');
+  data.week_dates.forEach(function (dateStr, i) {
+    var total = (data.week[dateStr] || []).length;
+    var btn = document.createElement('button');
+    btn.className = 'day-tab' + (dateStr === data.today ? ' is-today' : '');
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('data-date', dateStr);
+    btn.innerHTML = '<span class="dow">' + data.weekday_names[i] + '</span>' +
+      '<span class="dnum">' + dateStr.slice(0, 2) + '</span>' +
+      '<span class="count">' + (total ? total + ' дел' : '') + '</span>';
+    btn.addEventListener('click', function () { selectDate(dateStr); });
+    strip.appendChild(btn);
+  });
+
+  var content = document.getElementById('content');
+  function selectDate(dateStr) {
+    Array.prototype.forEach.call(strip.children, function (btn) {
+      btn.setAttribute('aria-selected', btn.getAttribute('data-date') === dateStr ? 'true' : 'false');
+    });
+    var tasks = data.week[dateStr] || [];
+    content.innerHTML = '';
+    if (!tasks.length) {
+      var empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'Задач не записано.';
+      content.appendChild(empty);
+      return;
+    }
+    CATEGORY_ORDER.forEach(function (cat) {
+      var inCat = tasks.filter(function (t) { return t.category === cat; });
+      if (!inCat.length) return;
+      var group = document.createElement('div');
+      group.className = 'group';
+      var label = document.createElement('div');
+      label.className = 'group-label';
+      label.textContent = cat;
+      group.appendChild(label);
+      var ul = document.createElement('ul');
+      ul.className = 'tasks';
+      inCat.forEach(function (t) {
+        var li = document.createElement('li');
+        var done = t.status === '✅';
+        if (done) li.className = 'done';
+        li.innerHTML = '<span class="box">' + (done ? '✅' : '☐') + '</span><span>' + escapeHtml(t.text) + '</span>';
+        ul.appendChild(li);
+      });
+      group.appendChild(ul);
+      content.appendChild(group);
+    });
+  }
+  selectDate(data.today);
+
+  var habitNames = Object.keys(data.habits || {});
+  var trackedHabits = habitNames.filter(function (name) { return Object.keys(data.habits[name]).length > 0; });
+  var habitsCard = document.getElementById('habits-card');
+  if (!trackedHabits.length) {
+    habitsCard.querySelector('.habit-scroll').innerHTML = '<p class="empty">За эту неделю привычки ещё не записаны.</p>';
+  } else {
+    var table = document.getElementById('habit-table');
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    headRow.innerHTML = '<th></th>' + data.weekday_names.map(function (dow, i) {
+      return '<th class="' + (data.week_dates[i] === data.today ? 'today-col' : '') + '">' + dow + '</th>';
+    }).join('');
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = document.createElement('tbody');
+    trackedHabits.forEach(function (name) {
+      var tr = document.createElement('tr');
+      var cells = '<td>' + escapeHtml(name) + '</td>';
+      data.week_dates.forEach(function (d) {
+        var val = data.habits[name][d];
+        var todayCls = d === data.today ? ' today-col' : '';
+        cells += val ? ('<td class="val filled' + todayCls + '">' + escapeHtml(val) + '</td>')
+                      : ('<td class="val dash' + todayCls + '">–</td>');
+      });
+      tr.innerHTML = cells;
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+  }
+
+  var goalsContent = document.getElementById('goals-content');
+  var goals = data.goals || [];
+  if (!goals.length) {
+    goalsContent.innerHTML = '<p class="empty">Целей пока нет.</p>';
+  } else {
+    ['месяц', 'год'].forEach(function (period) {
+      var periodGoals = goals.filter(function (g) { return g.period === period; });
+      if (!periodGoals.length) return;
+      var wrap = document.createElement('div');
+      wrap.className = 'goal-group';
+      var periodLabel = document.createElement('div');
+      periodLabel.className = 'goal-period';
+      periodLabel.textContent = 'На ' + period;
+      wrap.appendChild(periodLabel);
+      CATEGORY_ORDER.forEach(function (catLabel, idx) {
+        var catKey = ['работа', 'личное', 'дом'][idx];
+        var inCat = periodGoals.filter(function (g) { return g.category === catKey; });
+        if (!inCat.length) return;
+        var group = document.createElement('div');
+        group.className = 'group';
+        var label = document.createElement('div');
+        label.className = 'group-label';
+        label.textContent = catLabel;
+        group.appendChild(label);
+        var ul = document.createElement('ul');
+        ul.className = 'goals';
+        inCat.forEach(function (g) {
+          var li = document.createElement('li');
+          var done = g.status === '✅';
+          if (done) li.className = 'done';
+          var deadline = g.deadline ? '<span class="deadline">до ' + escapeHtml(g.deadline) + '</span>' : '';
+          li.innerHTML = '<span class="box">' + (done ? '✅' : '☐') + '</span><span style="flex:1">' + escapeHtml(g.text) + '</span>' + deadline;
+          ul.appendChild(li);
+        });
+        group.appendChild(ul);
+        wrap.appendChild(group);
+      });
+      goalsContent.appendChild(wrap);
+    });
+  }
+
+  var queue = (data.notes || []).map(function (n) { return Object.assign({ kind: '📝 заметка' }, n); })
+    .concat((data.ideas || []).map(function (n) { return Object.assign({ kind: '💡 идея для поста' }, n); }));
+  if (queue.length) {
+    queue.sort(function (a, b) { return (a.date + a.time).localeCompare(b.date + b.time); });
+    var queueCard = document.getElementById('queue-card');
+    queueCard.hidden = false;
+    var qc = document.getElementById('queue-content');
+    queue.forEach(function (item) {
+      var div = document.createElement('div');
+      div.className = 'queue-item';
+      div.innerHTML = '<div class="qmeta">' + item.kind + ' · ' + escapeHtml(item.date) + ' ' + escapeHtml(item.time) + '</div>' +
+        '<div class="qtext">' + escapeHtml(item.text) + '</div>';
+      qc.appendChild(div);
+    });
+  }
+})();
+</script>
+</body></html>"""
+
+def render_dashboard_page(owner, data):
+    style = OWNER_DASHBOARD_STYLE.get(owner, DEFAULT_DASHBOARD_STYLE)
+    display = display_name_for_owner(owner)
+    html = DASHBOARD_PAGE_TEMPLATE
+    html = html.replace("@@TITLE@@", f"Мой планер — {display}")
+    html = html.replace("@@EYEBROW@@", f"Мой планер · {display}")
+    html = html.replace("@@ACCENT_DARK@@", style["accent_dark"])
+    html = html.replace("@@ACCENT_BG_DARK@@", style["accent_bg_dark"])
+    html = html.replace("@@ACCENT_BG@@", style["accent_bg"])
+    html = html.replace("@@ACCENT@@", style["accent"])
+    html = html.replace("@@DATA_JSON@@", json.dumps(data, ensure_ascii=False))
+    return html
+
+async def refresh_dashboard_cache(owner):
+    if owner not in DASHBOARD_URLS:
+        return
+    try:
+        data = await asyncio.to_thread(build_dashboard_data, owner)
+        DASHBOARD_CACHE[owner] = render_dashboard_page(owner, data)
+    except Exception:
+        logger.exception(f"Не удалось обновить дашборд для {owner}")
+
+def schedule_dashboard_refresh(owner):
+    """Фоновое обновление кэша дашборда — вызывается после действий,
+    которые могли что-то поменять (не блокирует ответ пользователю)."""
+    if owner not in DASHBOARD_URLS:
+        return
+    try:
+        asyncio.get_running_loop().create_task(refresh_dashboard_cache(owner))
+    except RuntimeError:
+        pass
+
+async def refresh_all_dashboards(context: ContextTypes.DEFAULT_TYPE):
+    for owner in DASHBOARD_URLS:
+        await refresh_dashboard_cache(owner)
+
+async def dashboard_http_handler(request):
+    token = request.match_info["token"]
+    owner = DASHBOARD_TOKEN_TO_OWNER.get(token)
+    if not owner:
+        return web.Response(status=404, text="Страница не найдена.")
+    if request.query.get("refresh") == "1" or owner not in DASHBOARD_CACHE:
+        await refresh_dashboard_cache(owner)
+    html = DASHBOARD_CACHE.get(owner)
+    if not html:
+        return web.Response(status=503, text="Не удалось собрать данные, попробуй обновить через минуту.")
+    return web.Response(text=html, content_type="text/html", charset="utf-8")
+
+async def start_dashboard_server():
+    web_app = web.Application()
+    web_app.router.add_get("/d/{token}", dashboard_http_handler)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"🌐 Дашборд-сервер слушает на порту {port}")
+    return runner
+
+async def refresh_dashboard_after_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Регистрируется отдельным обработчиком с group=1 — срабатывает
+    после любого текста/голоса/фото/нажатия кнопки, независимо от того,
+    какая именно ветка внутри сработала (проще, чем расставлять вызов
+    по всем return в handle_text/handle_voice/handle_callback/
+    handle_health_photo)."""
+    if not is_allowed(update):
+        return
+    schedule_dashboard_refresh(owner_for(update))
+
 # ── Main ───────────────────────────────────────────────────────
-def main():
+async def main_async():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("menu",   menu_command))
@@ -1466,11 +1886,33 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_health_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    if DASHBOARD_URLS:
+        app.add_handler(MessageHandler(filters.VOICE, refresh_dashboard_after_update), group=1)
+        app.add_handler(MessageHandler(filters.PHOTO, refresh_dashboard_after_update), group=1)
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, refresh_dashboard_after_update), group=1)
+        app.add_handler(CallbackQueryHandler(refresh_dashboard_after_update), group=1)
     app.job_queue.run_daily(run_nightly_job, time=dt_time(hour=16, minute=0, tzinfo=timezone.utc))
     app.job_queue.run_daily(run_evening_checklist, time=dt_time(hour=16, minute=5, tzinfo=timezone.utc))
     app.job_queue.run_repeating(check_reminders, interval=REMINDER_CHECK_INTERVAL, first=10)
+    if DASHBOARD_URLS:
+        app.job_queue.run_repeating(refresh_all_dashboards, interval=300, first=15)
+
+    dashboard_runner = await start_dashboard_server() if DASHBOARD_URLS else None
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     logger.info("🤖 Бот запущен!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        if dashboard_runner:
+            await dashboard_runner.cleanup()
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
