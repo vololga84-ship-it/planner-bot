@@ -651,6 +651,12 @@ RU_MONTHS_GEN = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
     "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
+# Основа слова (без падежных окончаний) -> номер дня недели (0=понедельник,
+# как у datetime.weekday()), чтобы поймать «вторник»/«во вторник»/«вторника» и т.п.
+RU_WEEKDAYS = [
+    ("понедельник", 0), ("вторник", 1), ("сред", 2), ("четверг", 3),
+    ("пятниц", 4), ("суббот", 5), ("воскресень", 6),
+]
 
 def parse_flexible_date(text, today_dt):
     """Понимает "сегодня"/"вчера", "13.09"/"13.09.2026", "13 сентября" и
@@ -687,6 +693,13 @@ def parse_flexible_date(text, today_dt):
             return datetime(today_dt.year, month, day).strftime("%d.%m.%Y")
         except ValueError:
             return None
+
+    for stem, weekday in RU_WEEKDAYS:
+        if stem in t:
+            days_ahead = (weekday - today_dt.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7  # "во вторник" во вторник = следующий, не сегодня
+            return (today_dt + timedelta(days=days_ahead)).strftime("%d.%m.%Y")
     return None
 
 def is_allowed(update):
@@ -1013,7 +1026,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = parse_flexible_date(text, datetime.now())
         if not date_str:
             await update.message.reply_text(
-                "🤔 Не поняла дату. Напиши, например «сегодня», «вчера» или 13.09.")
+                "🤔 Не поняла дату. Напиши, например «вторник», «сегодня», «вчера» или 13.09.")
             return
         data = pending_health.pop(user_id)
         try:
@@ -1030,7 +1043,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = parse_flexible_date(text, datetime.now())
         if not date_str:
             await update.message.reply_text(
-                "🤔 Не поняла дату. Напиши, например «20.09» или «завтра».")
+                "🤔 Не поняла дату. Напиши, например «вторник», «20.09» или «завтра».")
             return
         entry = pending_postpone.pop(user_id)
         try:
@@ -1097,7 +1110,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = parse_flexible_date(text, datetime.now())
         if not date_str:
             await update.message.reply_text(
-                "🤔 Не поняла дату. Напиши, например «20.09» или «завтра».")
+                "🤔 Не поняла дату. Напиши, например «вторник», «20.09» или «завтра».")
             return
         user_states[user_id]["date"] = date_str
         user_states[user_id].pop("awaiting_date")
@@ -1193,7 +1206,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row_num = int(row_str)
         pending_postpone[user_id] = {"date_str": date_str, "row_num": row_num}
         await _remove_checklist_row(query, date_str, row_num)
-        await query.message.reply_text("📅 На какой день перенести? Напиши, например «20.09» или «завтра».")
+        await query.message.reply_text("📅 На какой день перенести? Напиши, например «вторник», «20.09» или «завтра».")
 
 async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
