@@ -4,7 +4,7 @@
 Без библиотеки groq — прямые HTTP запросы
 """
 
-import os, re, time, logging, json, tempfile, requests
+import os, re, time, logging, json, tempfile, base64, requests
 from datetime import datetime, timedelta, timezone, time as dt_time
 from dotenv import load_dotenv
 
@@ -147,6 +147,53 @@ def parse_task(text, today, habit_names, owner_names):
         raw = raw[start:end]
     return json.loads(raw)
 
+def extract_health_data(image_path):
+    """Извлекает данные сна/шагов со скриншота приложения здоровья через
+    Groq vision (та же модель, что разбирает текст задач — умеет и в
+    картинки). Поля, которых нет на скриншоте, остаются null."""
+    with open(image_path, "rb") as f:
+        b64_image = base64.b64encode(f.read()).decode("utf-8")
+    prompt = (
+        'Это скриншот приложения "Здоровье" (сон, шаги, активность). '
+        "Ответь ТОЛЬКО валидным JSON объектом, без пояснений, без markdown:\n"
+        '{"vstala":null,"legla":null,"son_dlitelnost":null,"shagi":null,"km":null,"minuty":null}\n\n'
+        "Поля (заполняй только то, что реально видно на экране, не выдумывай):\n"
+        "- vstala: время подъёма/пробуждения, формат ЧЧ:ММ\n"
+        "- legla: время отхода ко сну, формат ЧЧ:ММ\n"
+        '- son_dlitelnost: длительность сна как есть на экране (например "7ч 18м" или "7:18")\n'
+        "- shagi: число шагов (только цифры)\n"
+        "- km: пройденное расстояние в км (число, точка как разделитель)\n"
+        "- minuty: минуты ходьбы/активности (только цифры)"
+    )
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={**GROQ_HEADERS, "Content-Type": "application/json"},
+        json={
+            "model": "qwen/qwen3.6-27b",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                ],
+            }],
+            "max_tokens": 300,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": "none",
+            "reasoning_format": "hidden",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    start = raw.find("{")
+    end   = raw.rfind("}") + 1
+    if start >= 0 and end > start:
+        raw = raw[start:end]
+    return json.loads(raw)
+
 # ── Google Sheets: недельный шаблон ─────────────────────────────
 TEMPLATE_SHEET = "📅 Неделя"
 CATEGORY_ROWS = {
@@ -196,6 +243,15 @@ def get_habit_list():
 
 def habit_row_map():
     return {name: HABIT_START_ROW + i for i, name in enumerate(get_habit_list())}
+
+def find_habit_name(keyword):
+    """Ищет привычку по ключевому слову в её названии (список настраиваемый
+    пользователем в листе "⚙️ Мои привычки", поэтому не завязываемся на
+    точный текст/эмодзи). None, если такой привычки сейчас нет."""
+    for name in get_habit_list():
+        if keyword.lower() in name.lower():
+            return name
+    return None
 
 def get_sheet():
     creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
@@ -631,6 +687,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Привет, {owner}! Я твой личный планнер.\n\n"
         "🎤 Голосовое — запишу задачу\n"
         "✍️ Текст — тоже пойму\n"
+        "📸 Скриншот из «Здоровья» — запишу сон и шаги в привычки\n"
         "🗑 «Удали запись про...» — сотру подходящую запись\n"
         "💡 «Идеи для постов» — включит запись идей для постов\n"
         "📝 «Заметки» — включит запись сумбура на что угодно (план, письмо и т.д.)\n\n"
@@ -669,6 +726,70 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Voice error: {e}")
         await update.message.reply_text("❌ Не удалось расшифровать. Попробуй ещё раз.")
+
+async def handle_health_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скриншот из приложения "Здоровье" (сон/шаги) → данные в привычки
+    на сегодня. Что не распозналось на конкретном скрине — просто
+    пропускается (например, время отбоя есть только на экране деталей сна,
+    а не на главном экране)."""
+    if not is_allowed(update): return
+    owner = owner_for(update)
+    today = datetime.now().strftime("%d.%m.%Y")
+    photo = update.message.photo[-1]
+    file  = await context.bot.get_file(photo.file_id)
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        tmp_path = tmp.name
+    await update.message.reply_text("📸 Разбираю скриншот...")
+    try:
+        data = extract_health_data(tmp_path)
+    except Exception:
+        logger.exception("Health screenshot parsing failed")
+        await update.message.reply_text("❌ Не удалось распознать скриншот. Попробуй ещё раз.")
+        return
+    finally:
+        os.unlink(tmp_path)
+
+    def save_habit(keyword, value):
+        habit_name = find_habit_name(keyword)
+        if not habit_name:
+            return None
+        add_task_to_sheet(owner, "", habit_name, value, today, "habit")
+        return f"{habit_name}: {value}"
+
+    try:
+        saved = []
+        if data.get("vstala"):
+            line = save_habit("Встала", data["vstala"])
+            if line: saved.append(line)
+        if data.get("legla"):
+            line = save_habit("Легла", data["legla"])
+            if line: saved.append(line)
+        if data.get("son_dlitelnost"):
+            line = save_habit("сна", data["son_dlitelnost"])
+            if line: saved.append(line)
+
+        walk_parts = []
+        if data.get("shagi"):
+            walk_parts.append(f"{data['shagi']} шагов")
+        if data.get("km"):
+            walk_parts.append(f"{data['km']} км")
+        if data.get("minuty"):
+            walk_parts.append(f"{data['minuty']} мин")
+        if walk_parts:
+            line = save_habit("Прогулка", ", ".join(walk_parts))
+            if line: saved.append(line)
+    except Exception:
+        logger.exception("Could not save health data to weekly planner")
+        await update.message.reply_text("❌ Распознала скриншот, но не смогла записать в планнер.")
+        return
+
+    if not saved:
+        await update.message.reply_text(
+            "🤔 Не нашла на скриншоте ни одного нужного значения "
+            "(подъём, отбой, сон, шаги, км, минуты).")
+        return
+    await update.message.reply_text("✅ Записала со скриншота:\n\n" + "\n".join(saved))
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
@@ -982,6 +1103,7 @@ def main():
     app.add_handler(CommandHandler("habits", habits_command))
     app.add_handler(CommandHandler("goals",  goals_command))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_health_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.job_queue.run_daily(run_nightly_job, time=dt_time(hour=16, minute=0, tzinfo=timezone.utc))
