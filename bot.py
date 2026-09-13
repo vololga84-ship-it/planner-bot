@@ -71,13 +71,13 @@ def resolve_owner_name(spoken):
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("📋 Меню"), KeyboardButton("🗓 Таблица"), KeyboardButton("📅 Сегодня")],
-     [KeyboardButton("💡 Заметка")]],
+     [KeyboardButton("💡 Идеи для постов"), KeyboardButton("📝 Заметки")]],
     resize_keyboard=True,
     is_persistent=True,
 )
 
-NOTE_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton("⬅️ Выйти из заметок")]],
+CAPTURE_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("⬅️ Выйти")]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -396,28 +396,42 @@ def delete_goal(owner, row_num):
         return
     ws.update(f"B{row_num}:E{row_num}", [["", "", "", ""]])
 
-# ── Ideas (заметки для постов) ───────────────────────────────────
-IDEAS_SHEET = "💡 Идеи"
+# ── Идеи для постов + общие заметки ───────────────────────────────
+IDEAS_SHEET = "💡 Идеи для постов"
+NOTES_SHEET = "📝 Заметки"
 
-def get_ideas_sheet(create=False):
+def _get_or_create_log_sheet(title, create):
     sheet = get_sheet()
     try:
-        return sheet.worksheet(IDEAS_SHEET)
+        return sheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
         if not create:
             return None
-        ws = sheet.add_worksheet(title=IDEAS_SHEET, rows=200, cols=5)
-        ws.append_row(["Дата", "Время", "Владелец", "Заметка", "Статус"])
+        ws = sheet.add_worksheet(title=title, rows=200, cols=5)
+        ws.append_row(["Дата", "Время", "Владелец", "Текст", "Статус"])
         return ws
 
-def add_idea_to_sheet(owner, text):
-    ws = get_ideas_sheet(create=True)
+def _append_log_row(title, owner, text):
+    ws = _get_or_create_log_sheet(title, create=True)
     now = datetime.now()
     ws.append_row([now.strftime("%d.%m.%Y"), now.strftime("%H:%M"), owner, text, "новая"])
 
+def get_ideas_sheet(create=False):
+    return _get_or_create_log_sheet(IDEAS_SHEET, create)
+
+def add_idea_to_sheet(owner, text):
+    _append_log_row(IDEAS_SHEET, owner, text)
+
+def get_notes_sheet(create=False):
+    return _get_or_create_log_sheet(NOTES_SHEET, create)
+
+def add_note_to_sheet(owner, text):
+    _append_log_row(NOTES_SHEET, owner, text)
+
 # ── State ──────────────────────────────────────────────────────
 user_states = {}
-note_mode_users = set()
+post_idea_mode_users = set()
+general_notes_mode_users = set()
 
 def is_allowed(update):
     return str(update.effective_user.id) in ALLOWED_USERS
@@ -590,7 +604,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎤 Голосовое — запишу задачу\n"
         "✍️ Текст — тоже пойму\n"
         "🗑 «Удали запись про...» — сотру подходящую запись\n"
-        "💡 «Заметка» — включит режим заметок для идей на посты\n\n"
+        "💡 «Идеи для постов» — включит запись идей для постов\n"
+        "📝 «Заметки» — включит запись сумбура на что угодно (план, письмо и т.д.)\n\n"
         "📋 /today — задачи на сегодня\n"
         "✅ /done — отметить выполненное\n"
         "📊 /habits — привычки за день\n"
@@ -614,9 +629,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = transcribe_voice(tmp_path)
         os.unlink(tmp_path)
         await update.message.reply_text(f"📝 Услышала: _{text}_", parse_mode="Markdown")
-        if user_id in note_mode_users:
+        if user_id in post_idea_mode_users:
             add_idea_to_sheet(owner, text)
-            await update.message.reply_text("💡 Записала как заметку.")
+            await update.message.reply_text("💡 Записала как идею для поста.")
+            return
+        if user_id in general_notes_mode_users:
+            add_note_to_sheet(owner, text)
+            await update.message.reply_text("📝 Записала заметку.")
             return
         await process_text(update, text, owner)
     except Exception as e:
@@ -630,22 +649,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text    = (update.message.text or "").strip()
     today   = datetime.now().strftime("%d.%m.%Y")
 
-    if "Заметка" in text:
-        note_mode_users.add(user_id)
+    # Уже в одном из режимов записи — выходим только по явной кнопке
+    # «Выйти», а любой другой текст сохраняем как есть (даже если он
+    # случайно содержит слово "меню" или название другой кнопки).
+    if user_id in post_idea_mode_users or user_id in general_notes_mode_users:
+        if "Выйти" in text:
+            post_idea_mode_users.discard(user_id)
+            general_notes_mode_users.discard(user_id)
+            await update.message.reply_text("Вышли из режима записи.", reply_markup=MAIN_KEYBOARD)
+            return
+        if user_id in post_idea_mode_users:
+            add_idea_to_sheet(owner, text)
+            await update.message.reply_text(f"💡 Записала как идею для поста: _{text}_", parse_mode="Markdown")
+        else:
+            add_note_to_sheet(owner, text)
+            await update.message.reply_text(f"📝 Записала: _{text}_", parse_mode="Markdown")
+        return
+
+    if "Идеи для постов" in text:
+        post_idea_mode_users.add(user_id)
         await update.message.reply_text(
-            "💡 Режим заметок включён. Говори или пиши мысли — я всё сохраню.\n"
-            "Чтобы выйти, нажми «⬅️ Выйти из заметок».",
-            reply_markup=NOTE_KEYBOARD,
+            "💡 Режим «Идеи для постов» включён. Говори или пиши — сохраню как материал для постов.\n"
+            "Чтобы выйти, нажми «⬅️ Выйти».",
+            reply_markup=CAPTURE_KEYBOARD,
         )
         return
 
-    if user_id in note_mode_users:
-        if "Выйти" in text:
-            note_mode_users.discard(user_id)
-            await update.message.reply_text("Вышли из заметок.", reply_markup=MAIN_KEYBOARD)
-            return
-        add_idea_to_sheet(owner, text)
-        await update.message.reply_text(f"💡 Записала: _{text}_", parse_mode="Markdown")
+    if "Заметки" in text:
+        general_notes_mode_users.add(user_id)
+        await update.message.reply_text(
+            "📝 Режим «Заметки» включён. Накидывай сюда любой сумбур — план, черновик "
+            "ответа на письмо, что угодно. Потом попросишь причесать в нужную форму.\n"
+            "Чтобы выйти, нажми «⬅️ Выйти».",
+            reply_markup=CAPTURE_KEYBOARD,
+        )
         return
 
     # Handle persistent keyboard buttons (match by keyword, since some
