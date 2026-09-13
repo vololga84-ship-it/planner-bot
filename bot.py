@@ -5,7 +5,7 @@
 """
 
 import os, re, time, logging, json, tempfile, requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, time as dt_time
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
@@ -428,6 +428,34 @@ def get_notes_sheet(create=False):
 def add_note_to_sheet(owner, text):
     _append_log_row(NOTES_SHEET, owner, text)
 
+def get_new_notes_by_owner():
+    """Новые (статус "новая") заметки листа "Заметки", по владельцам,
+    отсортированные по дате и времени (старые первыми)."""
+    ws = get_notes_sheet(create=False)
+    if not ws:
+        return {}
+    rows = ws.get_all_values()
+    by_owner = {}
+    for i, row in enumerate(rows[1:], start=2):  # строка 1 — заголовок
+        date, time_str, owner, text, status = (row + [""] * 5)[:5]
+        if status.strip() != "новая" or not text.strip():
+            continue
+        try:
+            sort_key = datetime.strptime(f"{date} {time_str}", "%d.%m.%Y %H:%M")
+        except ValueError:
+            sort_key = datetime.min
+        by_owner.setdefault(owner, []).append((sort_key, i, text))
+    for owner in by_owner:
+        by_owner[owner].sort(key=lambda entry: entry[0])
+    return by_owner
+
+def mark_notes_processed(rows):
+    ws = get_notes_sheet(create=False)
+    if not ws:
+        return
+    for row in rows:
+        ws.update(f"E{row}", [["обработана"]])
+
 # ── State ──────────────────────────────────────────────────────
 user_states = {}
 post_idea_mode_users = set()
@@ -846,6 +874,103 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown")
 
+# ── Ночной агент: причёсывает "Заметки" в результат каждый вечер ─
+# Сейчас — через Groq (нет платного ключа Anthropic API, см. AGENTS.md).
+# Вся работа с моделью — в этой одной функции: когда появится ключ,
+# меняется реализация только structure_notes_for_owner, остальное — нет.
+NIGHT_AGENT_MODEL = "openai/gpt-oss-120b"
+MAX_NOTES_PER_OWNER_PER_NIGHT = 40
+TELEGRAM_MSG_LIMIT = 4096
+
+def structure_notes_for_owner(owner, notes):
+    """Причёсывает сумбурные заметки владельца в результат нужной формы.
+    Форму (план/письмо/список/что угодно) выбирает сама модель по смыслу.
+    Возвращает готовый текст или None, если модель ничего не вернула."""
+    notes_block = "\n".join(f"{i}. {text}" for i, text in enumerate(notes, 1))
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={**GROQ_HEADERS, "Content-Type": "application/json"},
+        json={
+            "model": NIGHT_AGENT_MODEL,
+            "messages": [
+                {"role": "system", "content": (
+                    "Ты помощник, который каждый вечер причёсывает сумбурные "
+                    "голосовые заметки в аккуратный результат. Сам выбери форму "
+                    "по смыслу заметок — план, черновик письма/сообщения, список "
+                    "дел или что-то ещё — не используй один и тот же шаблон "
+                    "всегда. Не выдумывай факты, которых нет в заметках. Если "
+                    "что-то похоже на плохо расслышанное слово (например, "
+                    "странное название) — не утверждай уверенно, отдельной "
+                    "строкой напиши, что тут не уверена и какое исходное слово "
+                    "могло иметься в виду. Пиши по-русски, обращайся на «ты»."
+                )},
+                {"role": "user", "content": f"Заметки {owner} за сегодня:\n{notes_block}"},
+            ],
+            "max_tokens": 3000,
+            "temperature": 0.3,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"].strip()
+    return content or None
+
+def split_into_telegram_chunks(text, limit=TELEGRAM_MSG_LIMIT):
+    """Режет текст на сообщения по границам абзацев; абзац длиннее лимита
+    режется жёстко по символам."""
+    chunks = []
+    current = ""
+    for paragraph in text.split("\n\n"):
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(paragraph) <= limit:
+            current = paragraph
+        else:
+            for start in range(0, len(paragraph), limit):
+                chunks.append(paragraph[start:start + limit])
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
+
+async def run_nightly_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежевечернее задание: у каждого владельца свои новые заметки
+    причёсываются в результат и уходят ему в Telegram."""
+    by_owner = get_new_notes_by_owner()
+    if not by_owner:
+        return
+    owner_to_id = {}
+    for telegram_id, name in USER_NAMES.items():
+        owner_to_id.setdefault(name, telegram_id)
+
+    for owner, entries in by_owner.items():
+        taken = entries[:MAX_NOTES_PER_OWNER_PER_NIGHT]
+        texts = [text for (_, _, text) in taken]
+        rows  = [row for (_, row, _) in taken]
+        chat_id = owner_to_id.get(owner)
+        if not chat_id:
+            logger.warning(f"Ночной агент: не найден Telegram ID для {owner}")
+            continue
+        try:
+            result = structure_notes_for_owner(owner, texts)
+        except Exception:
+            logger.exception(f"Ночной агент: сбой Groq для {owner}")
+            continue
+        if not result:
+            logger.warning(f"Ночной агент: пустой результат для {owner}")
+            continue
+        try:
+            for chunk in split_into_telegram_chunks(f"🌙 Вечерний разбор заметок:\n\n{result}"):
+                await context.bot.send_message(chat_id=int(chat_id), text=chunk)
+        except Exception:
+            logger.exception(f"Ночной агент: не удалось отправить результат {owner}")
+            continue
+        mark_notes_processed(rows)
+
 # ── Main ───────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -859,6 +984,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.job_queue.run_daily(run_nightly_job, time=dt_time(hour=16, minute=0, tzinfo=timezone.utc))
     logger.info("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
