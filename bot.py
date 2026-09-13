@@ -311,13 +311,36 @@ def find_habit_name(keyword):
             return name
     return None
 
+_sheet_cache = {"spreadsheet": None}
+
 def get_sheet():
+    """Открытая Google Таблица. Кешируется на весь процесс: open_by_key
+    сам по себе — отдельное чтение по квоте API, а раньше он выполнялся
+    заново на КАЖДЫЙ вызов любой функции, работающей с таблицей — при
+    нескольких участниках и нескольких фоновых заданиях (дашборд, ночной
+    агент, вечерний чек-лист) это одна из причин 429 "Quota exceeded".
+    google-auth сам обновляет токен доступа под капотом, так что кешировать
+    сам объект таблицы безопасно на весь срок жизни процесса."""
+    if _sheet_cache["spreadsheet"] is not None:
+        return _sheet_cache["spreadsheet"]
     creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
     scopes = ["https://spreadsheets.google.com/feeds",
               "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(SPREADSHEET_ID)
+    last_error = None
+    for attempt in range(4):
+        try:
+            _sheet_cache["spreadsheet"] = gc.open_by_key(SPREADSHEET_ID)
+            return _sheet_cache["spreadsheet"]
+        except gspread.exceptions.APIError as e:
+            last_error = e
+            status = getattr(e.response, "status_code", None)
+            if status == 429 and attempt < 3:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    raise last_error
 
 # ── Google Calendar: задачи с указанным временем ─────────────────
 _calendar_creds = None
@@ -1391,8 +1414,9 @@ MAX_NOTES_PER_OWNER_PER_NIGHT = 40
 TELEGRAM_MSG_LIMIT = 4096
 
 def structure_notes_for_owner(owner, notes):
-    """Причёсывает сумбурные заметки владельца в результат нужной формы.
-    Форму (план/письмо/список/что угодно) выбирает сама модель по смыслу.
+    """Причёсывает то, что НЕ разошлось по задачам/привычкам/целям
+    (см. run_nightly_job), в результат нужной формы. Форму (план,
+    черновик письма, список и т.п.) выбирает сама модель по смыслу.
     Возвращает готовый текст или None, если модель ничего не вернула."""
     notes_block = "\n".join(f"{i}. {text}" for i, text in enumerate(notes, 1))
     resp = requests.post(
@@ -1402,15 +1426,21 @@ def structure_notes_for_owner(owner, notes):
             "model": NIGHT_AGENT_MODEL,
             "messages": [
                 {"role": "system", "content": (
-                    "Ты помощник, который каждый вечер причёсывает сумбурные "
-                    "голосовые заметки в аккуратный результат. Сам выбери форму "
-                    "по смыслу заметок — план, черновик письма/сообщения, список "
-                    "дел или что-то ещё — не используй один и тот же шаблон "
-                    "всегда. Не выдумывай факты, которых нет в заметках. Если "
-                    "что-то похоже на плохо расслышанное слово (например, "
+                    "Ты помощник, который каждый вечер причёсывает то, что "
+                    "осталось от сумбурных голосовых заметок после того, как "
+                    "явные задачи/привычки/цели из них уже разложены по своим "
+                    "местам отдельно. Здесь — то, что не задача и не цель: "
+                    "мысли, план на подумать, черновик письма/сообщения и т.п. "
+                    "Сам выбери форму по смыслу — не используй один и тот же "
+                    "шаблон всегда. Не выдумывай факты, которых нет в заметках. "
+                    "Если что-то похоже на плохо расслышанное слово (например, "
                     "странное название) — не утверждай уверенно, отдельной "
                     "строкой напиши, что тут не уверена и какое исходное слово "
-                    "могло иметься в виду. Пиши по-русски, обращайся на «ты»."
+                    "могло иметься в виду. Если несколько заметок явно об одной "
+                    "повторяющейся теме, для которой в планнере нет своего места "
+                    "(не задача, не цель, не привычка) — можешь одной строкой "
+                    "предложить завести под неё отдельный раздел, не более. "
+                    "Пиши по-русски, обращайся на «ты»."
                 )},
                 {"role": "user", "content": f"Заметки {owner} за сегодня:\n{notes_block}"},
             ],
@@ -1422,6 +1452,41 @@ def structure_notes_for_owner(owner, notes):
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"].strip()
     return content or None
+
+def _file_parsed_note(owner, parsed, today):
+    """Пробует сохранить один разобранный parse_task-элемент в нужный
+    блок планнера (задача/привычка/цель) — теми же функциями, что и
+    обычная живая запись через process_text/save_task. Возвращает
+    короткую строку для сводки при успехе, None — если это не тот тип,
+    что раскладывается сюда (уходит в общий текст), и поднимает
+    исключение при сбое записи в таблицу (ловит вызывающий код)."""
+    ptype = parsed.get("type")
+    if ptype in ("task", "note"):
+        category = parsed.get("category") or "личное"
+        task     = parsed.get("task", "")
+        date_str = parsed.get("date") or today
+        time_str = parsed.get("time") or ""
+        add_task_to_sheet(owner, category, task, time_str, date_str)
+        if time_str:
+            add_calendar_event(owner, date_str, time_str, task, category)
+        when = "" if date_str == today else f" ({date_str})"
+        return f"✅ {task}{when}"
+    if ptype == "habit":
+        habit_name  = parsed.get("habit_name") or ""
+        habit_value = parsed.get("habit_value") or ""
+        add_task_to_sheet(owner, "", habit_name, habit_value, today, "habit")
+        return f"😴 {habit_name} — {habit_value}"
+    if ptype == "goal":
+        period    = parsed.get("period") or "месяц"
+        category  = parsed.get("category") or "личное"
+        goal_text = parsed.get("task", "")
+        if period not in GOAL_ROWS:
+            period = "месяц"
+        if category not in GOAL_ROWS.get(period, {}):
+            category = "личное"
+        add_goal(owner, period, category, goal_text)
+        return f"🎯 {goal_text} ({period})"
+    return None  # question / delete / peek / неизвестный тип — в общий текст
 
 def split_into_telegram_chunks(text, limit=TELEGRAM_MSG_LIMIT):
     """Режет текст на сообщения по границам абзацев; абзац длиннее лимита
@@ -1446,38 +1511,69 @@ def split_into_telegram_chunks(text, limit=TELEGRAM_MSG_LIMIT):
     return chunks or [text[:limit]]
 
 async def run_nightly_job(context: ContextTypes.DEFAULT_TYPE):
-    """Ежевечернее задание: у каждого владельца свои новые заметки
-    причёсываются в результат и уходят ему в Telegram."""
+    """Ежевечернее задание: у каждого владельца новые заметки сначала
+    пытаются разложиться по задачам/привычкам/целям (той же логикой, что
+    и обычная живая запись), а всё, что не подошло ни под один блок,
+    причёсывается в свободную форму и уходит вместе со сводкой филинга."""
     by_owner = get_new_notes_by_owner()
     if not by_owner:
         return
     owner_to_id = {}
     for telegram_id, name in USER_NAMES.items():
         owner_to_id.setdefault(name, telegram_id)
+    habit_names = get_habit_list()
+    today = datetime.now().strftime("%d.%m.%Y")
 
     for owner, entries in by_owner.items():
         taken = entries[:MAX_NOTES_PER_OWNER_PER_NIGHT]
-        texts = [text for (_, _, text) in taken]
-        rows  = [row for (_, row, _) in taken]
         chat_id = owner_to_id.get(owner)
         if not chat_id:
             logger.warning(f"Ночной агент: не найден Telegram ID для {owner}")
             continue
+
+        filed_lines, filed_rows = [], []
+        leftover_texts, leftover_rows = [], []
+        for _, row, text in taken:
+            try:
+                parsed = parse_task(text, today, habit_names, ALL_OWNERS)
+                summary_line = _file_parsed_note(owner, parsed, today)
+            except Exception:
+                logger.exception(f"Ночной агент: не удалось разложить заметку {owner}: {text!r}")
+                summary_line = None
+            if summary_line:
+                filed_lines.append(summary_line)
+                filed_rows.append(row)
+            else:
+                leftover_texts.append(text)
+                leftover_rows.append(row)
+
+        leftover_result = None
+        if leftover_texts:
+            try:
+                leftover_result = structure_notes_for_owner(owner, leftover_texts)
+            except Exception:
+                logger.exception(f"Ночной агент: сбой Groq (общий текст) для {owner}")
+
+        if not filed_lines and not leftover_result:
+            continue  # ничего не вышло — заметки остаются "новая" на завтра
+
+        parts = ["🌙 *Вечерний разбор заметок:*"]
+        if filed_lines:
+            parts.append("Разложила по планнеру:\n" + "\n".join(filed_lines))
+        if leftover_result:
+            parts.append(leftover_result)
+        full_text = "\n\n".join(parts)
+
         try:
-            result = structure_notes_for_owner(owner, texts)
-        except Exception:
-            logger.exception(f"Ночной агент: сбой Groq для {owner}")
-            continue
-        if not result:
-            logger.warning(f"Ночной агент: пустой результат для {owner}")
-            continue
-        try:
-            for chunk in split_into_telegram_chunks(f"🌙 Вечерний разбор заметок:\n\n{result}"):
-                await context.bot.send_message(chat_id=int(chat_id), text=chunk)
+            for chunk in split_into_telegram_chunks(full_text):
+                await context.bot.send_message(chat_id=int(chat_id), text=chunk, parse_mode="Markdown")
         except Exception:
             logger.exception(f"Ночной агент: не удалось отправить результат {owner}")
             continue
-        mark_notes_processed(rows)
+
+        rows_to_mark = filed_rows + (leftover_rows if leftover_result else [])
+        if rows_to_mark:
+            mark_notes_processed(rows_to_mark)
 
 async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
     """Вечерний чек-лист за сегодня: задачи (с кнопками "Сделано" /
@@ -1956,6 +2052,19 @@ async def refresh_dashboard_after_update(update: Update, context: ContextTypes.D
         return
     schedule_dashboard_refresh(owner_for(update))
 
+async def notify_users_about_restart(app):
+    """При каждом перезапуске бота (обычно — деплой новой версии)
+    сообщаем всем участникам, что стоит прислать /start: клавиатура с
+    кнопками у Telegram кешируется на стороне клиента и не обновится
+    сама, если поменялись кнопки или сброшено какое-то состояние."""
+    for telegram_id in USER_NAMES:
+        try:
+            await app.bot.send_message(
+                chat_id=int(telegram_id),
+                text="🔄 Бот обновился. Пришли /start, чтобы подтянулись актуальные кнопки.")
+        except Exception:
+            logger.exception(f"Не удалось уведомить о перезапуске: {telegram_id}")
+
 # ── Main ───────────────────────────────────────────────────────
 async def main_async():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1986,6 +2095,7 @@ async def main_async():
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     logger.info("🤖 Бот запущен!")
+    await notify_users_about_restart(app)
     try:
         await asyncio.Event().wait()
     finally:
