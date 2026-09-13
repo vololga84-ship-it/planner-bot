@@ -147,23 +147,36 @@ def parse_task(text, today, habit_names, owner_names):
         raw = raw[start:end]
     return json.loads(raw)
 
-def extract_health_data(image_path):
-    """Извлекает данные сна/шагов со скриншота приложения здоровья через
-    Groq vision (та же модель, что разбирает текст задач — умеет и в
-    картинки). Поля, которых нет на скриншоте, остаются null."""
+def extract_screenshot_data(image_path):
+    """Разбирает произвольный скриншот через Groq vision (та же модель,
+    что разбирает текст задач — умеет и в картинки): если это экран
+    приложения здоровья — извлекает данные сна/шагов; если что-то другое
+    (билет, переписка, документ) — переписывает весь видимый текст, чтобы
+    сохранить его как заметку. Поля, которых нет на скриншоте, null."""
     with open(image_path, "rb") as f:
         b64_image = base64.b64encode(f.read()).decode("utf-8")
     prompt = (
-        'Это скриншот приложения "Здоровье" (сон, шаги, активность). '
+        "Определи тип этого скриншота и извлеки данные. "
         "Ответь ТОЛЬКО валидным JSON объектом, без пояснений, без markdown:\n"
-        '{"vstala":null,"legla":null,"son_dlitelnost":null,"shagi":null,"km":null,"minuty":null}\n\n'
-        "Поля (заполняй только то, что реально видно на экране, не выдумывай):\n"
+        '{"vstala":null,"legla":null,"son_dlitelnost":null,"shagi":null,"km":null,'
+        '"minuty":null,"data_na_ekrane":null,"tekst":null}\n\n'
+        'Если это скриншот приложения "Здоровье" (сон, шаги, активность) — заполни '
+        'ниже описанные поля сна/шагов, "tekst" оставь null.\n'
+        'Если это НЕ скриншот здоровья (билет, переписка, документ, любой другой '
+        'экран с текстом) — поля здоровья оставь null, а в "tekst" перепиши ВЕСЬ '
+        "видимый на экране текст как можно точнее и по порядку, не теряя важные "
+        "детали (даты, время, места, имена, суммы).\n\n"
+        "Поля здоровья (заполняй только то, что реально видно на экране, не выдумывай):\n"
         "- vstala: время подъёма/пробуждения, формат ЧЧ:ММ\n"
         "- legla: время отхода ко сну, формат ЧЧ:ММ\n"
         '- son_dlitelnost: длительность сна как есть на экране (например "7ч 18м" или "7:18")\n'
         "- shagi: число шагов (только цифры)\n"
         "- km: пройденное расстояние в км (число, точка как разделитель)\n"
-        "- minuty: минуты ходьбы/активности (только цифры)"
+        "- minuty: минуты ходьбы/активности (только цифры)\n"
+        '- data_na_ekrane: дата или день, к которому относятся эти данные, ТОЧНО как '
+        'написано на экране (например "13 сентября", "Сб", "Сегодня", "Вчера", "13.09") — '
+        "если на экране вообще нет никакого указания на дату/день, оставь null. "
+        "Не путай это с временем (ЧЧ:ММ) — здесь нужна именно дата/день."
     )
     resp = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -177,7 +190,7 @@ def extract_health_data(image_path):
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
                 ],
             }],
-            "max_tokens": 300,
+            "max_tokens": 1200,
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
             "reasoning_effort": "none",
@@ -516,6 +529,49 @@ def mark_notes_processed(rows):
 user_states = {}
 post_idea_mode_users = set()
 general_notes_mode_users = set()
+pending_health = {}  # user_id -> данные со скриншота "Здоровья", ждём дату
+
+RU_MONTHS_GEN = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+
+def parse_flexible_date(text, today_dt):
+    """Понимает "сегодня"/"вчера", "13.09"/"13.09.2026", "13 сентября" и
+    похожее. Возвращает строку ДД.ММ.ГГГГ или None, если не поняла."""
+    if not text:
+        return None
+    t = text.strip().lower()
+    if "сегодня" in t:
+        return today_dt.strftime("%d.%m.%Y")
+    if "вчера" in t:
+        return (today_dt - timedelta(days=1)).strftime("%d.%m.%Y")
+
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", t)
+    if m:
+        day, month, year = (int(x) for x in m.groups())
+        try:
+            return datetime(year, month, day).strftime("%d.%m.%Y")
+        except ValueError:
+            return None
+
+    m = re.search(r"(\d{1,2})\s+(" + "|".join(RU_MONTHS_GEN) + r")", t)
+    if m:
+        day = int(m.group(1))
+        month = RU_MONTHS_GEN[m.group(2)]
+        try:
+            return datetime(today_dt.year, month, day).strftime("%d.%m.%Y")
+        except ValueError:
+            return None
+
+    m = re.search(r"(\d{1,2})\.(\d{1,2})(?!\.\d)", t)
+    if m:
+        day, month = (int(x) for x in m.groups())
+        try:
+            return datetime(today_dt.year, month, day).strftime("%d.%m.%Y")
+        except ValueError:
+            return None
+    return None
 
 def is_allowed(update):
     return str(update.effective_user.id) in ALLOWED_USERS
@@ -687,7 +743,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Привет, {owner}! Я твой личный планнер.\n\n"
         "🎤 Голосовое — запишу задачу\n"
         "✍️ Текст — тоже пойму\n"
-        "📸 Скриншот из «Здоровья» — запишу сон и шаги в привычки\n"
+        "📸 Скриншот — из «Здоровья» запишу сон и шаги в привычки, "
+        "любой другой сохраню как заметку\n"
         "🗑 «Удали запись про...» — сотру подходящую запись\n"
         "💡 «Идеи для постов» — включит запись идей для постов\n"
         "📝 «Заметки» — включит запись сумбура на что угодно (план, письмо и т.д.)\n\n"
@@ -727,69 +784,97 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Voice error: {e}")
         await update.message.reply_text("❌ Не удалось расшифровать. Попробуй ещё раз.")
 
+def save_health_data(owner, date_str, data):
+    """Пишет распознанные со скриншота значения в привычки за date_str.
+    Возвращает список строк с тем, что реально записалось (что не
+    распозналось на конкретном скрине или привычка была переименована/
+    удалена в настройках — просто пропускается)."""
+    def save_habit(keyword, value):
+        habit_name = find_habit_name(keyword)
+        if not habit_name:
+            return None
+        add_task_to_sheet(owner, "", habit_name, value, date_str, "habit")
+        return f"{habit_name}: {value}"
+
+    saved = []
+    if data.get("vstala"):
+        line = save_habit("Встала", data["vstala"])
+        if line: saved.append(line)
+    if data.get("legla"):
+        line = save_habit("Легла", data["legla"])
+        if line: saved.append(line)
+    if data.get("son_dlitelnost"):
+        line = save_habit("сна", data["son_dlitelnost"])
+        if line: saved.append(line)
+
+    walk_parts = []
+    if data.get("shagi"):
+        walk_parts.append(f"{data['shagi']} шагов")
+    if data.get("km"):
+        walk_parts.append(f"{data['km']} км")
+    if data.get("minuty"):
+        walk_parts.append(f"{data['minuty']} мин")
+    if walk_parts:
+        line = save_habit("Прогулка", ", ".join(walk_parts))
+        if line: saved.append(line)
+    return saved
+
 async def handle_health_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Скриншот из приложения "Здоровье" (сон/шаги) → данные в привычки
-    на сегодня. Что не распозналось на конкретном скрине — просто
-    пропускается (например, время отбоя есть только на экране деталей сна,
-    а не на главном экране)."""
+    """Любой присланный скриншот: если это "Здоровье" (сон/шаги) — данные
+    уходят в привычки, дата берётся с самого скриншота (если её там видно,
+    иначе бот спрашивает — иначе данные за прошлый день улетают не в тот
+    столбец). Если скриншот не про здоровье (билет, переписка, документ) —
+    весь видимый текст сохраняется как обычная заметка в лист "📝 Заметки",
+    чтобы потом её можно было причесать в задачу/план через notes-structurer."""
     if not is_allowed(update): return
-    owner = owner_for(update)
-    today = datetime.now().strftime("%d.%m.%Y")
-    photo = update.message.photo[-1]
-    file  = await context.bot.get_file(photo.file_id)
+    owner   = owner_for(update)
+    user_id = str(update.effective_user.id)
+    photo   = update.message.photo[-1]
+    file    = await context.bot.get_file(photo.file_id)
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         await file.download_to_drive(tmp.name)
         tmp_path = tmp.name
     await update.message.reply_text("📸 Разбираю скриншот...")
     try:
-        data = extract_health_data(tmp_path)
+        data = extract_screenshot_data(tmp_path)
     except Exception:
-        logger.exception("Health screenshot parsing failed")
+        logger.exception("Screenshot parsing failed")
         await update.message.reply_text("❌ Не удалось распознать скриншот. Попробуй ещё раз.")
         return
     finally:
         os.unlink(tmp_path)
 
-    def save_habit(keyword, value):
-        habit_name = find_habit_name(keyword)
-        if not habit_name:
-            return None
-        add_task_to_sheet(owner, "", habit_name, value, today, "habit")
-        return f"{habit_name}: {value}"
+    has_health_data = any(data.get(k) for k in ("vstala", "legla", "son_dlitelnost", "shagi", "km", "minuty"))
+
+    if not has_health_data:
+        text = (data.get("tekst") or "").strip()
+        if not text:
+            await update.message.reply_text("🤔 Не смогла разобрать ничего полезного на этом скриншоте.")
+            return
+        try:
+            add_note_to_sheet(owner, text)
+        except Exception:
+            logger.exception("Could not save screenshot text to notes")
+            await update.message.reply_text("❌ Распознала текст, но не смогла записать в заметки.")
+            return
+        await update.message.reply_text(f"📝 Записала текст со скриншота в заметки:\n\n{text}")
+        return
+
+    date_str = parse_flexible_date(data.get("data_na_ekrane"), datetime.now())
+    if not date_str:
+        pending_health[user_id] = data
+        await update.message.reply_text(
+            "📅 Не поняла, за какой день этот скриншот — на нём не видно даты. "
+            "Напиши, например «сегодня», «вчера» или 13.09.")
+        return
 
     try:
-        saved = []
-        if data.get("vstala"):
-            line = save_habit("Встала", data["vstala"])
-            if line: saved.append(line)
-        if data.get("legla"):
-            line = save_habit("Легла", data["legla"])
-            if line: saved.append(line)
-        if data.get("son_dlitelnost"):
-            line = save_habit("сна", data["son_dlitelnost"])
-            if line: saved.append(line)
-
-        walk_parts = []
-        if data.get("shagi"):
-            walk_parts.append(f"{data['shagi']} шагов")
-        if data.get("km"):
-            walk_parts.append(f"{data['km']} км")
-        if data.get("minuty"):
-            walk_parts.append(f"{data['minuty']} мин")
-        if walk_parts:
-            line = save_habit("Прогулка", ", ".join(walk_parts))
-            if line: saved.append(line)
+        saved = save_health_data(owner, date_str, data)
     except Exception:
         logger.exception("Could not save health data to weekly planner")
         await update.message.reply_text("❌ Распознала скриншот, но не смогла записать в планнер.")
         return
-
-    if not saved:
-        await update.message.reply_text(
-            "🤔 Не нашла на скриншоте ни одного нужного значения "
-            "(подъём, отбой, сон, шаги, км, минуты).")
-        return
-    await update.message.reply_text("✅ Записала со скриншота:\n\n" + "\n".join(saved))
+    await update.message.reply_text(f"✅ Записала на {date_str} со скриншота:\n\n" + "\n".join(saved))
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
@@ -797,6 +882,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner   = owner_for(update)
     text    = (update.message.text or "").strip()
     today   = datetime.now().strftime("%d.%m.%Y")
+
+    # Ждём уточнение даты для скриншота "Здоровья" — этот ответ не должен
+    # попасть ни в режимы заметок, ни в разбор задачи.
+    if user_id in pending_health:
+        date_str = parse_flexible_date(text, datetime.now())
+        if not date_str:
+            await update.message.reply_text(
+                "🤔 Не поняла дату. Напиши, например «сегодня», «вчера» или 13.09.")
+            return
+        data = pending_health.pop(user_id)
+        try:
+            saved = save_health_data(owner, date_str, data)
+        except Exception:
+            logger.exception("Could not save health data to weekly planner")
+            await update.message.reply_text("❌ Не смогла записать в планнер.")
+            return
+        await update.message.reply_text(f"✅ Записала на {date_str} со скриншота:\n\n" + "\n".join(saved))
+        return
 
     # Уже в одном из режимов записи — выходим только по явной кнопке
     # «Выйти», а любой другой текст сохраняем как есть (даже если он
