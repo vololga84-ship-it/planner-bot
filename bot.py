@@ -100,7 +100,7 @@ def resolve_owner_name(spoken):
     return None
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton("📋 Меню"), KeyboardButton("🗓 Таблица"), KeyboardButton("📅 Сегодня")],
+    [[KeyboardButton("📋 Меню"), KeyboardButton("📊 Дашборд"), KeyboardButton("📅 Сегодня")],
      [KeyboardButton("💡 Идеи для постов"), KeyboardButton("📝 Заметки")]],
     resize_keyboard=True,
     is_persistent=True,
@@ -972,7 +972,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "Меню" in text:
         await menu_command(update, context)
         return
-    if "Таблица" in text:
+    if "Дашборд" in text or "Таблица" in text:
         await table_command(update, context)
         return
     if "Сегодня" in text:
