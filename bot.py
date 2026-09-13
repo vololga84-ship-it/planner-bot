@@ -24,6 +24,7 @@ TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
 SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID")
 SPREADSHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+DASHBOARD_URL   = "https://claude.ai/code/artifact/6fdfd173-3cee-4084-a8d4-28ae4495596c"
 
 def _parse_users(raw):
     """USERS=182778711:Оля,555555555:Мама — Telegram ID -> имя владельца."""
@@ -1079,9 +1080,12 @@ async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
-    keyboard = [[InlineKeyboardButton("📊 Открыть таблицу", url=SPREADSHEET_URL)]]
+    keyboard = [
+        [InlineKeyboardButton("📊 Дашборд (неделя)", url=DASHBOARD_URL)],
+        [InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)],
+    ]
     await update.message.reply_text(
-        "📊 *Твой планнер в Google Таблицах:*\n\nНажми кнопку ниже чтобы открыть:",
+        "📊 *Твой планнер:*\n\nДашборд — наглядный снимок недели. Таблица — все данные как есть.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown")
 
@@ -1092,6 +1096,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Отметить выполненное", callback_data="menu_done")],
         [InlineKeyboardButton("📊 Привычки", callback_data="menu_habits")],
         [InlineKeyboardButton("🎯 Цели", callback_data="menu_goals")],
+        [InlineKeyboardButton("📊 Дашборд (неделя)", url=DASHBOARD_URL)],
         [InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)],
     ]
     await update.message.reply_text(
