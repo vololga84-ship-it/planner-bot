@@ -1545,6 +1545,7 @@ async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
 OWNER_DASHBOARD_STYLE = {
     "Оля": {"accent": "#1F7A6C", "accent_bg": "#E4F1EE", "accent_dark": "#4FBBA4", "accent_bg_dark": "#1D3530"},
     "Мама": {"accent": "#B8722E", "accent_bg": "#F6ECDD", "accent_dark": "#E0A45E", "accent_bg_dark": "#3A2E1C"},
+    "Юля": {"accent": "#A63D5E", "accent_bg": "#F5E3E9", "accent_dark": "#E37B98", "accent_bg_dark": "#3A1F28"},
 }
 DEFAULT_DASHBOARD_STYLE = {"accent": "#3B6EA8", "accent_bg": "#E4EBF6", "accent_dark": "#6FA0DE", "accent_bg_dark": "#1E2C40"}
 
