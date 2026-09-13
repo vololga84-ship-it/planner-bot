@@ -694,13 +694,14 @@ def is_allowed(update):
 
 # ── Save task ──────────────────────────────────────────────────
 async def save_task(update_or_query, parsed, default_date, owner):
-    date_str  = parsed.get("date") or default_date
-    category  = parsed.get("category", "личное")
-    task      = parsed.get("task", "")
-    time_str  = parsed.get("time") or ""
-    cat_emoji = {"работа": "💼", "личное": "👤", "дом": "🏠"}.get(category, "📌")
+    date_given = bool(parsed.get("date"))
+    date_str   = parsed.get("date") or default_date
+    category   = parsed.get("category", "личное")
+    task       = parsed.get("task", "")
+    time_str   = parsed.get("time") or ""
+    cat_emoji  = {"работа": "💼", "личное": "👤", "дом": "🏠"}.get(category, "📌")
     try:
-        add_task_to_sheet(owner, category, task, time_str, date_str)
+        row_num = add_task_to_sheet(owner, category, task, time_str, date_str)
     except Exception:
         logger.exception("Could not save task to weekly planner")
         await update_or_query.message.reply_text(
@@ -711,7 +712,14 @@ async def save_task(update_or_query, parsed, default_date, owner):
     time_info = f" в {time_str}" if time_str else ""
     text = (f"✅ Записала!\n\n{cat_emoji} *{category.capitalize()}*\n"
             f"📌 {task}{time_info}\n📅 {date_str}")
-    await update_or_query.message.reply_text(text, parse_mode="Markdown")
+    # Дату никто не называл — записала на сегодня по умолчанию, но
+    # вдруг имелся в виду другой день: даём лёгкий способ поправить,
+    # не заставляя отвечать на вопрос при каждой обычной задаче.
+    keyboard = None
+    if not date_given:
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📅 Не сегодня, перенести", callback_data=f"evpost_{date_str}_{row_num}")]])
+    await update_or_query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 # ── Просмотр чужого расписания ("peek") ─────────────────────────
 async def send_peek(update, target_owner, date_str):
@@ -1086,7 +1094,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user_id in user_states and user_states[user_id].get("awaiting_date"):
-        user_states[user_id]["date"] = text
+        date_str = parse_flexible_date(text, datetime.now())
+        if not date_str:
+            await update.message.reply_text(
+                "🤔 Не поняла дату. Напиши, например «20.09» или «завтра».")
+            return
+        user_states[user_id]["date"] = date_str
         user_states[user_id].pop("awaiting_date")
         parsed = user_states.pop(user_id)
         await save_task(update, parsed, today, owner)
