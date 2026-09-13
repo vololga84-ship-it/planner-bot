@@ -745,6 +745,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✍️ Текст — тоже пойму\n"
         "📸 Скриншот — из «Здоровья» запишу сон и шаги в привычки, "
         "любой другой сохраню как заметку\n"
+        "⏰ Напомню за час и за сутки до любой задачи с указанным временем\n"
         "🗑 «Удали запись про...» — сотру подходящую запись\n"
         "💡 «Идеи для постов» — включит запись идей для постов\n"
         "📝 «Заметки» — включит запись сумбура на что угодно (план, письмо и т.д.)\n\n"
@@ -1098,6 +1099,71 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown")
 
+# ── Напоминания о задачах с указанным временем ──────────────────
+REMINDER_CHECK_INTERVAL = 300  # секунд между проверками
+REMINDER_WINDOW_MINUTES = 5    # ширина окна срабатывания (под интервал проверки)
+REMINDER_RULES = (
+    # (на сколько дней вперёд смотреть, за сколько минут напомнить, метка, текст)
+    (0, 60,        "1h", "⏰ Через час"),
+    (1, 24 * 60,   "1d", "📅 Завтра"),
+)
+sent_reminders = set()  # (owner, date_str, row_num, метка) — чтобы не слать повторно
+
+def split_task_time(text):
+    """Отделяет время от текста задачи вида "Позвонить врачу — 14:00".
+    Возвращает (текст_без_времени, "14:00") или (text, None), если
+    времени нет."""
+    m = re.search(r"\s—\s(\d{1,2}:\d{2})$", text)
+    if not m:
+        return text, None
+    return text[:m.start()].strip(), m.group(1)
+
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Каждые REMINDER_CHECK_INTERVAL секунд смотрит задачи с указанным
+    временем на сегодня и на завтра и шлёт напоминание за час и за сутки
+    до момента задачи (владельцу этой задачи, не всем)."""
+    now = datetime.now()
+    owner_to_id = {}
+    for telegram_id, name in USER_NAMES.items():
+        owner_to_id.setdefault(name, telegram_id)
+
+    for owner in ALL_OWNERS:
+        chat_id = owner_to_id.get(owner)
+        if not chat_id:
+            continue
+        for days_ahead, minutes_before, kind, prefix in REMINDER_RULES:
+            date_str = (now + timedelta(days=days_ahead)).strftime("%d.%m.%Y")
+            try:
+                tasks = get_tasks_for_day(date_str, owner)
+            except Exception:
+                logger.exception(f"Reminder check failed for {owner} {date_str}")
+                continue
+            for row_num, row in tasks:
+                if len(row) >= 5 and row[4] == "habit":
+                    continue
+                if (row[3] if len(row) > 3 else "☐") == "✅":
+                    continue
+                task_text, time_str = split_task_time(row[1])
+                if not time_str:
+                    continue
+                try:
+                    target_dt = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
+                except ValueError:
+                    continue
+                delta_minutes = (target_dt - now).total_seconds() / 60
+                if not (minutes_before - REMINDER_WINDOW_MINUTES <= delta_minutes <= minutes_before):
+                    continue
+                key = (owner, date_str, row_num, kind)
+                if key in sent_reminders:
+                    continue
+                sent_reminders.add(key)
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(chat_id),
+                        text=f"{prefix}: {task_text} в {time_str} ({date_str})")
+                except Exception:
+                    logger.exception(f"Could not send reminder to {owner}")
+
 # ── Ночной агент: причёсывает "Заметки" в результат каждый вечер ─
 # Сейчас — через Groq (нет платного ключа Anthropic API, см. AGENTS.md).
 # Вся работа с моделью — в этой одной функции: когда появится ключ,
@@ -1210,6 +1276,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.job_queue.run_daily(run_nightly_job, time=dt_time(hour=16, minute=0, tzinfo=timezone.utc))
+    app.job_queue.run_repeating(check_reminders, interval=REMINDER_CHECK_INTERVAL, first=10)
     logger.info("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
