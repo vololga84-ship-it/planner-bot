@@ -15,6 +15,7 @@ from telegram.ext import (
 )
 import gspread
 from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from aiohttp import web
 
 load_dotenv()
@@ -26,22 +27,30 @@ GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
 SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID")
 SPREADSHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
 
-def _parse_dashboard_urls(raw):
-    """DASHBOARD_URLS=Оля:https://...,Мама:https://... — у каждого своя
-    личная страница-дашборд (видит только свои задачи), поэтому это
-    словарь по владельцу, а не одна общая ссылка."""
-    urls = {}
+def _parse_owner_map(raw):
+    """Общий разбор строк вида "Оля:значение,Мама:значение" — используется
+    и для DASHBOARD_URLS (значение — ссылка), и для CALENDAR_IDS
+    (значение — email календаря), у каждого владельца своё."""
+    result = {}
     for part in (raw or "").split(","):
         part = part.strip()
         if not part or ":" not in part:
             continue
-        owner, url = part.split(":", 1)
-        owner, url = owner.strip(), url.strip()
-        if owner and url:
-            urls[owner] = url
-    return urls
+        owner, value = part.split(":", 1)
+        owner, value = owner.strip(), value.strip()
+        if owner and value:
+            result[owner] = value
+    return result
 
-DASHBOARD_URLS = _parse_dashboard_urls(os.getenv("DASHBOARD_URLS"))
+DASHBOARD_URLS = _parse_owner_map(os.getenv("DASHBOARD_URLS"))
+# CALENDAR_IDS=Оля:oly.gmail@gmail.com,Мама:lena.gmail@gmail.com — календарь
+# каждого владельца, куда бот пишет задачи с указанным временем. Чтобы
+# заработало, владелец должен один раз расшарить свой Google Календарь
+# сервисному аккаунту бота (email из GOOGLE_CREDENTIALS_JSON, поле
+# client_email) с правом "Изменение мероприятий" — так же, как расшарена
+# таблица.
+CALENDAR_IDS = _parse_owner_map(os.getenv("CALENDAR_IDS"))
+CALENDAR_TIMEZONE = os.getenv("CALENDAR_TIMEZONE", "Asia/Yekaterinburg")
 
 def _parse_users(raw):
     """USERS=182778711:Оля,555555555:Мама:Лена — Telegram ID -> (имя
@@ -310,6 +319,50 @@ def get_sheet():
     gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID)
 
+# ── Google Calendar: задачи с указанным временем ─────────────────
+_calendar_creds = None
+
+def get_calendar_access_token():
+    """Токен того же сервисного аккаунта, что и для Sheets, но с
+    отдельным scope на календарь (кэшируется, google-auth сам обновляет
+    протухший токен при .refresh())."""
+    global _calendar_creds
+    if _calendar_creds is None:
+        creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+        _calendar_creds = Credentials.from_service_account_info(
+            creds_dict, scopes=["https://www.googleapis.com/auth/calendar.events"])
+    if not _calendar_creds.valid:
+        _calendar_creds.refresh(GoogleAuthRequest())
+    return _calendar_creds.token
+
+def add_calendar_event(owner, date_str, time_str, summary, category):
+    """Пишет задачу с указанным временем в личный Google Календарь
+    владельца (час по умолчанию длительность). Тихо ничего не делает,
+    если для владельца не настроен CALENDAR_IDS или календарь ещё не
+    расшарен сервисному аккаунту — задача при этом всё равно остаётся
+    записанной в планере, календарь тут просто дополнительная копия."""
+    calendar_id = CALENDAR_IDS.get(owner)
+    if not calendar_id or not time_str:
+        return
+    try:
+        start_dt = datetime.strptime(f"{date_str} {time_str}", "%d.%m.%Y %H:%M")
+        end_dt = start_dt + timedelta(hours=1)
+        token = get_calendar_access_token()
+        body = {
+            "summary": summary,
+            "description": f"Из «Мой планер» ({category})" if category else "Из «Мой планер»",
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": CALENDAR_TIMEZONE},
+            "end": {"dateTime": end_dt.isoformat(), "timeZone": CALENDAR_TIMEZONE},
+        }
+        resp = requests.post(
+            f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body, timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception:
+        logger.exception(f"Не удалось записать событие в календарь {owner}")
+
 def week_start(date_str):
     day = datetime.strptime(date_str, "%d.%m.%Y")
     return day - timedelta(days=day.weekday())
@@ -431,6 +484,8 @@ def move_task_to_date(owner, date_str, row_num, new_date_str):
     category = category_for_row(row_num)
     add_task_to_sheet(owner, category, task_text, time_str or "", new_date_str)
     delete_entry_from_sheet(date_str, owner, row_num)
+    if time_str:
+        add_calendar_event(owner, new_date_str, time_str, task_text, category)
     return task_text
 
 def find_matching_entries(date_str, owner, query):
@@ -651,6 +706,8 @@ async def save_task(update_or_query, parsed, default_date, owner):
         await update_or_query.message.reply_text(
             "❌ Не удалось записать задачу в недельный планнер. Попробуй ещё раз.")
         return
+    if time_str:
+        add_calendar_event(owner, date_str, time_str, task, category)
     time_info = f" в {time_str}" if time_str else ""
     text = (f"✅ Записала!\n\n{cat_emoji} *{category.capitalize()}*\n"
             f"📌 {task}{time_info}\n📅 {date_str}")
