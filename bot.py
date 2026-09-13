@@ -408,6 +408,30 @@ def delete_entry_from_sheet(date_str, owner, row_num):
     column = day_column(date_str)
     ws.update(f"{column}{row_num}", [[""]])
 
+def category_for_row(row_num):
+    for category, (start_row, end_row, _label) in CATEGORY_ROWS.items():
+        if start_row <= row_num <= end_row:
+            return category
+    return "личное"
+
+def move_task_to_date(owner, date_str, row_num, new_date_str):
+    """Переносит задачу из (date_str, row_num) на new_date_str, сохраняя
+    категорию и время. Возвращает текст перенесённой задачи (без
+    чекбокса/времени) или None, если ячейка была уже пуста (например,
+    перенесли дважды)."""
+    ws = get_week_sheet(date_str, owner, create=False)
+    if not ws:
+        return None
+    column = day_column(date_str)
+    value = (ws.acell(f"{column}{row_num}").value or "").strip()
+    if not value:
+        return None
+    task_text, time_str = split_task_time(value.lstrip("☐✅ ").strip())
+    category = category_for_row(row_num)
+    add_task_to_sheet(owner, category, task_text, time_str or "", new_date_str)
+    delete_entry_from_sheet(date_str, owner, row_num)
+    return task_text
+
 def find_matching_entries(date_str, owner, query):
     """Найти задачи/привычки за день и цели ВЛАДЕЛЬЦА owner, похожие на
     query, по совпадению слов (без учёта эмодзи/пунктуации). Возвращает
@@ -565,6 +589,7 @@ user_states = {}
 post_idea_mode_users = set()
 general_notes_mode_users = set()
 pending_health = {}  # user_id -> данные со скриншота "Здоровья", ждём дату
+pending_postpone = {}  # user_id -> {"date_str", "row_num"}, ждём дату переноса
 
 RU_MONTHS_GEN = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
@@ -782,6 +807,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     general_notes_mode_users.discard(user_id)
     user_states.pop(user_id, None)
     pending_health.pop(user_id, None)
+    pending_postpone.pop(user_id, None)
     await update.message.reply_text(
         f"👋 Привет, {display_name_for(update)}! Я твой личный планнер.\n\n"
         "Говори или пиши — разберу, что это: задача, привычка, цель или заметка. "
@@ -933,6 +959,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Записала на {date_str} со скриншота:\n\n" + "\n".join(saved))
         return
 
+    # Ждём дату для переноса задачи из вечернего чек-листа.
+    if user_id in pending_postpone:
+        date_str = parse_flexible_date(text, datetime.now())
+        if not date_str:
+            await update.message.reply_text(
+                "🤔 Не поняла дату. Напиши, например «20.09» или «завтра».")
+            return
+        entry = pending_postpone.pop(user_id)
+        try:
+            moved = move_task_to_date(owner, entry["date_str"], entry["row_num"], date_str)
+        except Exception:
+            logger.exception("Could not move task to new date")
+            await update.message.reply_text("❌ Не удалось перенести задачу.")
+            return
+        if moved:
+            await update.message.reply_text(f"→ Перенесла «{moved}» на {date_str}.")
+        else:
+            await update.message.reply_text("🤔 Не нашла эту задачу — может, уже перенесена.")
+        return
+
     # Уже в одном из режимов записи — выходим только по явной кнопке
     # «Выйти», а любой другой текст сохраняем как есть (даже если он
     # случайно содержит слово "меню" или название другой кнопки).
@@ -989,6 +1035,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await process_text(update, text, owner)
 
+async def _remove_checklist_row(query, date_str, row_num):
+    """Убирает из клавиатуры вечернего чек-листа строку кнопок,
+    относящуюся к этой задаче (её уже отметили сделанной или перенесли),
+    оставляя кнопки остальных задач как есть."""
+    suffix = f"_{date_str}_{row_num}"
+    kb = query.message.reply_markup
+    if not kb:
+        return
+    new_rows = [row for row in kb.inline_keyboard
+                if not (row and row[0].callback_data and row[0].callback_data.endswith(suffix))]
+    await query.edit_message_reply_markup(InlineKeyboardMarkup(new_rows) if new_rows else None)
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
@@ -1030,6 +1088,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             delete_entry_from_sheet(date_str, owner, row_num)
         await query.edit_message_text("🗑 Запись удалена.")
+    elif data.startswith("evdone_"):
+        _, date_str, row_str = data.split("_", 2)
+        row_num = int(row_str)
+        mark_task_done(date_str, owner, row_num)
+        await _remove_checklist_row(query, date_str, row_num)
+        await query.message.reply_text("✅ Отметила как сделано.")
+    elif data.startswith("evpost_"):
+        _, date_str, row_str = data.split("_", 2)
+        row_num = int(row_str)
+        new_keyboard = []
+        for row in query.message.reply_markup.inline_keyboard:
+            if row and row[0].callback_data == data:
+                new_keyboard.append([
+                    InlineKeyboardButton("📅 Завтра", callback_data=f"evtmrw_{date_str}_{row_num}"),
+                    InlineKeyboardButton("✏️ Другой день", callback_data=f"evcust_{date_str}_{row_num}"),
+                ])
+            else:
+                new_keyboard.append(row)
+        await query.edit_message_reply_markup(InlineKeyboardMarkup(new_keyboard))
+    elif data.startswith("evtmrw_"):
+        _, date_str, row_str = data.split("_", 2)
+        row_num  = int(row_str)
+        tomorrow = (datetime.strptime(date_str, "%d.%m.%Y") + timedelta(days=1)).strftime("%d.%m.%Y")
+        moved = move_task_to_date(owner, date_str, row_num, tomorrow)
+        await _remove_checklist_row(query, date_str, row_num)
+        if moved:
+            await query.message.reply_text(f"→ Перенесла «{moved}» на {tomorrow}.")
+        else:
+            await query.message.reply_text("🤔 Не нашла эту задачу — может, уже перенесена.")
+    elif data.startswith("evcust_"):
+        _, date_str, row_str = data.split("_", 2)
+        row_num = int(row_str)
+        pending_postpone[user_id] = {"date_str": date_str, "row_num": row_num}
+        await _remove_checklist_row(query, date_str, row_num)
+        await query.message.reply_text("📅 На какой день перенести? Напиши, например «20.09» или «завтра».")
 
 async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
@@ -1302,6 +1395,63 @@ async def run_nightly_job(context: ContextTypes.DEFAULT_TYPE):
             continue
         mark_notes_processed(rows)
 
+async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
+    """Вечерний чек-лист за сегодня: задачи (с кнопками "Сделано" /
+    "Перенести" у невыполненных) и привычки (только информационно —
+    привычку на завтра не перенесёшь, не отмечена — значит не сделана)."""
+    today = datetime.now().strftime("%d.%m.%Y")
+    owner_to_id = {}
+    for telegram_id, name in USER_NAMES.items():
+        owner_to_id.setdefault(name, telegram_id)
+
+    habit_list = get_habit_list()
+    for owner in ALL_OWNERS:
+        chat_id = owner_to_id.get(owner)
+        if not chat_id:
+            continue
+        try:
+            tasks = [(rn, row) for rn, row in get_tasks_for_day(today, owner)
+                     if len(row) < 5 or row[4] != "habit"]
+        except Exception:
+            logger.exception(f"Вечерний чек-лист: не удалось прочитать задачи {owner}")
+            tasks = []
+        try:
+            habits_today = dict((row[1], row[2]) for _, row in get_habits_for_day(today, owner))
+        except Exception:
+            logger.exception(f"Вечерний чек-лист: не удалось прочитать привычки {owner}")
+            habits_today = {}
+
+        if not tasks and not habit_list:
+            continue
+
+        lines = [f"🌙 *Вечерний чек-лист, {today}:*", "", "📋 *Задачи:*"]
+        keyboard = []
+        if not tasks:
+            lines.append("_Задач нет._")
+        for row_num, row in tasks:
+            status = row[3] if len(row) > 3 else "☐"
+            lines.append(f"{status} {row[1]}")
+            if status != "✅":
+                keyboard.append([
+                    InlineKeyboardButton("✅ Сделано", callback_data=f"evdone_{today}_{row_num}"),
+                    InlineKeyboardButton("→ Перенести", callback_data=f"evpost_{today}_{row_num}"),
+                ])
+        if habit_list:
+            lines.append("")
+            lines.append("😴 *Привычки:*")
+            for name in habit_list:
+                if name in habits_today:
+                    lines.append(f"✅ {name} — {habits_today[name]}")
+                else:
+                    lines.append(f"➖ {name} — нет данных")
+
+        try:
+            await context.bot.send_message(
+                chat_id=int(chat_id), text="\n".join(lines), parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+        except Exception:
+            logger.exception(f"Вечерний чек-лист: не удалось отправить {owner}")
+
 # ── Main ───────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1317,6 +1467,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.job_queue.run_daily(run_nightly_job, time=dt_time(hour=16, minute=0, tzinfo=timezone.utc))
+    app.job_queue.run_daily(run_evening_checklist, time=dt_time(hour=16, minute=5, tzinfo=timezone.utc))
     app.job_queue.run_repeating(check_reminders, interval=REMINDER_CHECK_INTERVAL, first=10)
     logger.info("🤖 Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
