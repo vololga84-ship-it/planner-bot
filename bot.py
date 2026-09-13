@@ -70,7 +70,14 @@ def resolve_owner_name(spoken):
     return None
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton("📋 Меню"), KeyboardButton("🗓 Таблица"), KeyboardButton("📅 Сегодня")]],
+    [[KeyboardButton("📋 Меню"), KeyboardButton("🗓 Таблица"), KeyboardButton("📅 Сегодня")],
+     [KeyboardButton("💡 Заметка")]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+NOTE_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("⬅️ Выйти из заметок")]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -389,8 +396,28 @@ def delete_goal(owner, row_num):
         return
     ws.update(f"B{row_num}:E{row_num}", [["", "", "", ""]])
 
+# ── Ideas (заметки для постов) ───────────────────────────────────
+IDEAS_SHEET = "💡 Идеи"
+
+def get_ideas_sheet(create=False):
+    sheet = get_sheet()
+    try:
+        return sheet.worksheet(IDEAS_SHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        if not create:
+            return None
+        ws = sheet.add_worksheet(title=IDEAS_SHEET, rows=200, cols=5)
+        ws.append_row(["Дата", "Время", "Владелец", "Заметка", "Статус"])
+        return ws
+
+def add_idea_to_sheet(owner, text):
+    ws = get_ideas_sheet(create=True)
+    now = datetime.now()
+    ws.append_row([now.strftime("%d.%m.%Y"), now.strftime("%H:%M"), owner, text, "новая"])
+
 # ── State ──────────────────────────────────────────────────────
 user_states = {}
+note_mode_users = set()
 
 def is_allowed(update):
     return str(update.effective_user.id) in ALLOWED_USERS
@@ -562,7 +589,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Привет, {owner}! Я твой личный планнер.\n\n"
         "🎤 Голосовое — запишу задачу\n"
         "✍️ Текст — тоже пойму\n"
-        "🗑 «Удали запись про...» — сотру подходящую запись\n\n"
+        "🗑 «Удали запись про...» — сотру подходящую запись\n"
+        "💡 «Заметка» — включит режим заметок для идей на посты\n\n"
         "📋 /today — задачи на сегодня\n"
         "✅ /done — отметить выполненное\n"
         "📊 /habits — привычки за день\n"
@@ -574,7 +602,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
-    owner = owner_for(update)
+    owner   = owner_for(update)
+    user_id = str(update.effective_user.id)
     voice = update.message.voice
     file  = await context.bot.get_file(voice.file_id)
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
@@ -585,6 +614,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = transcribe_voice(tmp_path)
         os.unlink(tmp_path)
         await update.message.reply_text(f"📝 Услышала: _{text}_", parse_mode="Markdown")
+        if user_id in note_mode_users:
+            add_idea_to_sheet(owner, text)
+            await update.message.reply_text("💡 Записала как заметку.")
+            return
         await process_text(update, text, owner)
     except Exception as e:
         logger.error(f"Voice error: {e}")
@@ -596,6 +629,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner   = owner_for(update)
     text    = (update.message.text or "").strip()
     today   = datetime.now().strftime("%d.%m.%Y")
+
+    if "Заметка" in text:
+        note_mode_users.add(user_id)
+        await update.message.reply_text(
+            "💡 Режим заметок включён. Говори или пиши мысли — я всё сохраню.\n"
+            "Чтобы выйти, нажми «⬅️ Выйти из заметок».",
+            reply_markup=NOTE_KEYBOARD,
+        )
+        return
+
+    if user_id in note_mode_users:
+        if "Выйти" in text:
+            note_mode_users.discard(user_id)
+            await update.message.reply_text("Вышли из заметок.", reply_markup=MAIN_KEYBOARD)
+            return
+        add_idea_to_sheet(owner, text)
+        await update.message.reply_text(f"💡 Записала: _{text}_", parse_mode="Markdown")
+        return
 
     # Handle persistent keyboard buttons (match by keyword, since some
     # Telegram clients add/drop emoji variation selectors on the label)
