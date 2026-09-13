@@ -99,12 +99,17 @@ def resolve_owner_name(spoken):
             return name
     return None
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton("📋 Меню"), KeyboardButton("📊 Дашборд"), KeyboardButton("📅 Сегодня")],
-     [KeyboardButton("💡 Идеи для постов"), KeyboardButton("📝 Заметки")]],
-    resize_keyboard=True,
-    is_persistent=True,
-)
+# Кто ведёт блог — только этим владельцам показываем кнопку "Идеи для
+# постов" (у остальных участников семейного бота такой функции нет).
+BLOG_OWNERS = set(o.strip() for o in os.getenv("BLOG_OWNERS", "Оля").split(",") if o.strip())
+
+def main_keyboard_for(owner):
+    row2 = ([KeyboardButton("💡 Идеи для постов")] if owner in BLOG_OWNERS else []) + [KeyboardButton("📝 Заметки")]
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📋 Меню"), KeyboardButton("📊 Дашборд"), KeyboardButton("📅 Сегодня")], row2],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 CAPTURE_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("⬅️ Выйти")]],
@@ -768,6 +773,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Перешли его тому, кто настраивает бота, чтобы получить доступ.",
             parse_mode="Markdown")
         return
+    owner = owner_for(update)
+    idea_line = "💡 «Идеи для постов» — включит запись идей для постов\n" if owner in BLOG_OWNERS else ""
     await update.message.reply_text(
         f"👋 Привет, {display_name_for(update)}! Я твой личный планнер.\n\n"
         "🎤 Голосовое — запишу задачу\n"
@@ -776,7 +783,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "любой другой сохраню как заметку\n"
         "⏰ Напомню за час и за сутки до любой задачи с указанным временем\n"
         "🗑 «Удали запись про...» — сотру подходящую запись\n"
-        "💡 «Идеи для постов» — включит запись идей для постов\n"
+        f"{idea_line}"
         "📝 «Заметки» — включит запись сумбура на что угодно (план, письмо и т.д.)\n\n"
         "📋 /today — задачи на сегодня\n"
         "✅ /done — отметить выполненное\n"
@@ -785,7 +792,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🗓 /table — открыть таблицу\n"
         "📋 /menu — главное меню\n\n"
         "Просто говори — я пойму! 😊",
-        reply_markup=MAIN_KEYBOARD)
+        reply_markup=main_keyboard_for(owner))
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
@@ -938,7 +945,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "Выйти" in text:
             post_idea_mode_users.discard(user_id)
             general_notes_mode_users.discard(user_id)
-            await update.message.reply_text("Вышли из режима записи.", reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_text("Вышли из режима записи.", reply_markup=main_keyboard_for(owner))
             return
         if user_id in post_idea_mode_users:
             add_idea_to_sheet(owner, text)
@@ -948,7 +955,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📝 Записала: _{text}_", parse_mode="Markdown")
         return
 
-    if "Идеи для постов" in text:
+    if "Идеи для постов" in text and owner in BLOG_OWNERS:
         post_idea_mode_users.add(user_id)
         await update.message.reply_text(
             "💡 Режим «Идеи для постов» включён. Говори или пиши — сохраню как материал для постов.\n"
