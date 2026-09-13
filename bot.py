@@ -24,24 +24,53 @@ TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
 SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID")
 SPREADSHEET_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
-DASHBOARD_URL   = "https://claude.ai/code/artifact/6fdfd173-3cee-4084-a8d4-28ae4495596c"
 
-def _parse_users(raw):
-    """USERS=182778711:Оля,555555555:Мама — Telegram ID -> имя владельца."""
-    users = {}
+def _parse_dashboard_urls(raw):
+    """DASHBOARD_URLS=Оля:https://...,Мама:https://... — у каждого своя
+    личная страница-дашборд (видит только свои задачи), поэтому это
+    словарь по владельцу, а не одна общая ссылка."""
+    urls = {}
     for part in (raw or "").split(","):
         part = part.strip()
         if not part or ":" not in part:
             continue
-        uid, name = part.split(":", 1)
-        uid, name = uid.strip(), name.strip()
+        owner, url = part.split(":", 1)
+        owner, url = owner.strip(), url.strip()
+        if owner and url:
+            urls[owner] = url
+    return urls
+
+DASHBOARD_URLS = _parse_dashboard_urls(os.getenv("DASHBOARD_URLS"))
+
+def _parse_users(raw):
+    """USERS=182778711:Оля,555555555:Мама:Лена — Telegram ID -> (имя
+    владельца в планере, обращение к ней самой). Третье поле необязательно
+    — например, для семейного бота дочери зовут её "Мама" (так называется
+    её лист/привычки/цели, так её ищут в "peek"), а бот при обращении К
+    НЕЙ самой говорит "Лена". Без третьего поля обращение = имя владельца."""
+    users = {}
+    display_names = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        fields = [f.strip() for f in part.split(":")]
+        uid  = fields[0]
+        name = fields[1] if len(fields) > 1 else ""
+        display = fields[2] if len(fields) > 2 and fields[2] else name
         if uid and name:
             users[uid] = name
-    return users
+            display_names[uid] = display
+    return users, display_names
 
-USER_NAMES    = _parse_users(os.getenv("USERS"))
+USER_NAMES, DISPLAY_NAMES = _parse_users(os.getenv("USERS"))
 ALLOWED_USERS = set(USER_NAMES.keys())
 ALL_OWNERS    = list(dict.fromkeys(USER_NAMES.values()))  # без дублей, сохраняя порядок
+
+def display_name_for(update):
+    """Как обращаться к самому пользователю (может отличаться от имени
+    владельца в планере — см. _parse_users)."""
+    return DISPLAY_NAMES.get(str(update.effective_user.id)) or owner_for(update)
 
 def owner_for(update):
     return USER_NAMES.get(str(update.effective_user.id), "Гость")
@@ -739,9 +768,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Перешли его тому, кто настраивает бота, чтобы получить доступ.",
             parse_mode="Markdown")
         return
-    owner = owner_for(update)
     await update.message.reply_text(
-        f"👋 Привет, {owner}! Я твой личный планнер.\n\n"
+        f"👋 Привет, {display_name_for(update)}! Я твой личный планнер.\n\n"
         "🎤 Голосовое — запишу задачу\n"
         "✍️ Текст — тоже пойму\n"
         "📸 Скриншот — из «Здоровья» запишу сон и шаги в привычки, "
@@ -1080,25 +1108,31 @@ async def goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
-    keyboard = [
-        [InlineKeyboardButton("📊 Дашборд (неделя)", url=DASHBOARD_URL)],
-        [InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)],
-    ]
+    owner = owner_for(update)
+    keyboard = []
+    dashboard_url = DASHBOARD_URLS.get(owner)
+    if dashboard_url:
+        keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", url=dashboard_url)])
+    keyboard.append([InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)])
     await update.message.reply_text(
-        "📊 *Твой планнер:*\n\nДашборд — наглядный снимок недели. Таблица — все данные как есть.",
+        "📊 *Твой планнер:*\n\nДашборд — наглядный снимок недели (только твои задачи). "
+        "Таблица — все данные как есть.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown")
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
+    owner = owner_for(update)
     keyboard = [
         [InlineKeyboardButton("📅 Задачи на сегодня", callback_data="menu_today")],
         [InlineKeyboardButton("✅ Отметить выполненное", callback_data="menu_done")],
         [InlineKeyboardButton("📊 Привычки", callback_data="menu_habits")],
         [InlineKeyboardButton("🎯 Цели", callback_data="menu_goals")],
-        [InlineKeyboardButton("📊 Дашборд (неделя)", url=DASHBOARD_URL)],
-        [InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)],
     ]
+    dashboard_url = DASHBOARD_URLS.get(owner)
+    if dashboard_url:
+        keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", url=dashboard_url)])
+    keyboard.append([InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)])
     await update.message.reply_text(
         "📋 *Главное меню:*",
         reply_markup=InlineKeyboardMarkup(keyboard),
