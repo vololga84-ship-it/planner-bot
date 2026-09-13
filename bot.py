@@ -313,6 +313,32 @@ def find_habit_name(keyword):
 
 _sheet_cache = {"spreadsheet": None}
 
+def _retry_on_quota(bound_method, delays=(0.4, 0.9)):
+    """Оборачивает связанный метод gspread-клиента коротким повтором при
+    429 "Quota exceeded". Все операции gspread (get/update/append_row/
+    open_by_key/...) в итоге идут через client.request — обернув именно
+    его один раз здесь, повтор автоматически получают вообще все вызовы
+    к Google Sheets в проекте.
+
+    Задержки нарочно маленькие (меньше секунды суммарно): весь бот —
+    синхронный код внутри async-обработчиков, без переноса в отдельный
+    поток (кроме дашборда), поэтому time.sleep() здесь блокирует ВЕСЬ
+    бот на это время — долгая экспоненциальная задержка при устойчивом
+    исчерпании квоты означала бы зависшие на десятки секунд кнопки у
+    всех участников сразу, что хуже, чем просто быстро уронить один
+    вызов и залогировать его."""
+    def wrapper(*args, **kwargs):
+        for i, delay in enumerate((*delays, None)):
+            try:
+                return bound_method(*args, **kwargs)
+            except gspread.exceptions.APIError as e:
+                status = getattr(e.response, "status_code", None)
+                if status == 429 and delay is not None:
+                    time.sleep(delay)
+                    continue
+                raise
+    return wrapper
+
 def get_sheet():
     """Открытая Google Таблица. Кешируется на весь процесс: open_by_key
     сам по себе — отдельное чтение по квоте API, а раньше он выполнялся
@@ -328,19 +354,9 @@ def get_sheet():
               "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
-    last_error = None
-    for attempt in range(4):
-        try:
-            _sheet_cache["spreadsheet"] = gc.open_by_key(SPREADSHEET_ID)
-            return _sheet_cache["spreadsheet"]
-        except gspread.exceptions.APIError as e:
-            last_error = e
-            status = getattr(e.response, "status_code", None)
-            if status == 429 and attempt < 3:
-                time.sleep(2 ** attempt)
-                continue
-            raise
-    raise last_error
+    gc.request = _retry_on_quota(gc.request)
+    _sheet_cache["spreadsheet"] = gc.open_by_key(SPREADSHEET_ID)
+    return _sheet_cache["spreadsheet"]
 
 # ── Google Calendar: задачи с указанным временем ─────────────────
 _calendar_creds = None
