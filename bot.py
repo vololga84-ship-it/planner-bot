@@ -113,8 +113,14 @@ def resolve_owner_name(spoken):
 # постов" (у остальных участников семейного бота такой функции нет).
 BLOG_OWNERS = set(o.strip() for o in os.getenv("BLOG_OWNERS", "Оля").split(",") if o.strip())
 
+# Кто администрирует бота — этим кнопка "Идея для бота" не нужна (сами
+# себе предложения не шлют); все остальные владельцы её видят.
+BOT_ADMIN_OWNERS = set(o.strip() for o in os.getenv("BOT_ADMIN_OWNERS", "Оля").split(",") if o.strip())
+
 def main_keyboard_for(owner):
     row2 = ([KeyboardButton("💡 Идеи для постов")] if owner in BLOG_OWNERS else []) + [KeyboardButton("📝 Заметки")]
+    if owner not in BOT_ADMIN_OWNERS:
+        row2 = row2 + [KeyboardButton("🛠 Идея для бота")]
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📋 Меню"), KeyboardButton("📊 Дашборд"), KeyboardButton("📅 Сегодня")], row2],
         resize_keyboard=True,
@@ -636,8 +642,9 @@ def delete_goal(owner, row_num):
     ws.update(f"B{row_num}:E{row_num}", [["", "", "", ""]])
 
 # ── Идеи для постов + общие заметки ───────────────────────────────
-IDEAS_SHEET = "💡 Идеи для постов"
-NOTES_SHEET = "📝 Заметки"
+IDEAS_SHEET     = "💡 Идеи для постов"
+NOTES_SHEET     = "📝 Заметки"
+BOT_IDEAS_SHEET = "🛠 Идеи для бота"
 
 def _get_or_create_log_sheet(title, create):
     sheet = get_sheet()
@@ -667,10 +674,16 @@ def get_notes_sheet(create=False):
 def add_note_to_sheet(owner, text):
     _append_log_row(NOTES_SHEET, owner, text)
 
-def get_new_notes_by_owner():
-    """Новые (статус "новая") заметки листа "Заметки", по владельцам,
-    отсортированные по дате и времени (старые первыми)."""
-    ws = get_notes_sheet(create=False)
+def get_bot_ideas_sheet(create=False):
+    return _get_or_create_log_sheet(BOT_IDEAS_SHEET, create)
+
+def add_bot_idea_to_sheet(owner, text):
+    _append_log_row(BOT_IDEAS_SHEET, owner, text)
+
+def get_new_entries_by_owner(ws):
+    """Новые (статус "новая") записи листа-лога (Идеи/Заметки/Идеи для
+    бота), по владельцам, отсортированные по дате и времени (старые
+    первыми). Общая логика для всех трёх листов такой формы."""
     if not ws:
         return {}
     rows = ws.get_all_values()
@@ -688,17 +701,23 @@ def get_new_notes_by_owner():
         by_owner[owner].sort(key=lambda entry: entry[0])
     return by_owner
 
-def mark_notes_processed(rows):
-    ws = get_notes_sheet(create=False)
+def mark_entries_processed(ws, rows):
     if not ws:
         return
     for row in rows:
         ws.update(f"E{row}", [["обработана"]])
 
+def get_new_notes_by_owner():
+    return get_new_entries_by_owner(get_notes_sheet(create=False))
+
+def mark_notes_processed(rows):
+    mark_entries_processed(get_notes_sheet(create=False), rows)
+
 # ── State ──────────────────────────────────────────────────────
 user_states = {}
 post_idea_mode_users = set()
 general_notes_mode_users = set()
+bot_idea_mode_users = set()
 pending_health = {}  # user_id -> данные со скриншота "Здоровья", ждём дату
 pending_postpone = {}  # user_id -> {"date_str", "row_num"}, ждём дату переноса
 
@@ -953,6 +972,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # пользователя и показываем обычную клавиатуру заново.
     post_idea_mode_users.discard(user_id)
     general_notes_mode_users.discard(user_id)
+    bot_idea_mode_users.discard(user_id)
     user_states.pop(user_id, None)
     pending_health.pop(user_id, None)
     pending_postpone.pop(user_id, None)
@@ -984,6 +1004,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id in general_notes_mode_users:
             add_note_to_sheet(owner, text)
             await update.message.reply_text("📝 Записала заметку.")
+            return
+        if user_id in bot_idea_mode_users:
+            add_bot_idea_to_sheet(owner, text)
+            await update.message.reply_text("🛠 Записала идею для бота.")
             return
         await process_text(update, text, owner)
     except Exception as e:
@@ -1130,18 +1154,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Уже в одном из режимов записи — выходим только по явной кнопке
     # «Выйти», а любой другой текст сохраняем как есть (даже если он
     # случайно содержит слово "меню" или название другой кнопки).
-    if user_id in post_idea_mode_users or user_id in general_notes_mode_users:
+    if user_id in post_idea_mode_users or user_id in general_notes_mode_users or user_id in bot_idea_mode_users:
         if "Выйти" in text:
             post_idea_mode_users.discard(user_id)
             general_notes_mode_users.discard(user_id)
+            bot_idea_mode_users.discard(user_id)
             await update.message.reply_text("Вышли из режима записи.", reply_markup=main_keyboard_for(owner))
             return
         if user_id in post_idea_mode_users:
             add_idea_to_sheet(owner, text)
             await update.message.reply_text(f"💡 Записала как идею для поста: _{text}_", parse_mode="Markdown")
-        else:
+        elif user_id in general_notes_mode_users:
             add_note_to_sheet(owner, text)
             await update.message.reply_text(f"📝 Записала: _{text}_", parse_mode="Markdown")
+        else:
+            add_bot_idea_to_sheet(owner, text)
+            await update.message.reply_text(f"🛠 Записала идею для бота: _{text}_", parse_mode="Markdown")
         return
 
     if "Идеи для постов" in text and owner in BLOG_OWNERS:
@@ -1158,6 +1186,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📝 Режим «Заметки» включён. Накидывай сюда любой сумбур — план, черновик "
             "ответа на письмо, что угодно. Потом попросишь причесать в нужную форму.\n"
+            "Чтобы выйти, нажми «⬅️ Выйти».",
+            reply_markup=CAPTURE_KEYBOARD,
+        )
+        return
+
+    if "Идея для бота" in text and owner not in BOT_ADMIN_OWNERS:
+        bot_idea_mode_users.add(user_id)
+        await update.message.reply_text(
+            "🛠 Режим «Идея для бота» включён. Говори или пиши, что хотела бы поменять "
+            "или добавить в боте — вечером соберу это и перешлю тому, кто его настраивает.\n"
             "Чтобы выйти, нажми «⬅️ Выйти».",
             reply_markup=CAPTURE_KEYBOARD,
         )
@@ -1620,6 +1658,79 @@ async def run_nightly_job(context: ContextTypes.DEFAULT_TYPE):
         rows_to_mark = filed_rows + (leftover_rows if leftover_result else [])
         if rows_to_mark:
             mark_notes_processed(rows_to_mark)
+
+def structure_bot_ideas(entries_by_owner):
+    """Причёсывает предложения по боту от разных участников в одну
+    сводку для администратора. Группирует похожее, убирает повторы, но
+    ничего не выдумывает и не додумывает — если идея неясна, так и
+    пишет, вместо того чтобы угадывать. Возвращает текст или None."""
+    blocks = []
+    for owner, texts in entries_by_owner.items():
+        numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(texts, 1))
+        blocks.append(f"От {owner}:\n{numbered}")
+    ideas_block = "\n\n".join(blocks)
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={**GROQ_HEADERS, "Content-Type": "application/json"},
+        json={
+            "model": NIGHT_AGENT_MODEL,
+            "messages": [
+                {"role": "system", "content": (
+                    "Ты помогаешь администратору Telegram-бота-планнера разобрать "
+                    "предложения по улучшению бота от других участников. Сделай "
+                    "короткую ясную сводку: сгруппируй похожие идеи, убери дословные "
+                    "повторы, но сохрани суть и то, кто именно предложил каждую. Не "
+                    "выдумывай ничего сверх сказанного и не додумывай детали "
+                    "реализации. Если какая-то идея сформулирована непонятно — так и "
+                    "напиши прямо, не пытайся угадать, что имелось в виду. Пиши "
+                    "по-русски, по-деловому, но не сухо."
+                )},
+                {"role": "user", "content": ideas_block},
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.3,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"].strip()
+    return content or None
+
+async def run_bot_ideas_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Ежевечернее задание: предложения по боту от всех, кто не
+    администратор, собираются в одну сводку и уходят администратору
+    (обычно один человек, но поддерживает и несколько)."""
+    entries_by_owner = get_new_entries_by_owner(get_bot_ideas_sheet(create=False))
+    if not entries_by_owner:
+        return
+    owner_to_id = {}
+    for telegram_id, name in USER_NAMES.items():
+        owner_to_id.setdefault(name, telegram_id)
+
+    texts_by_owner = {owner: [text for _, _, text in entries] for owner, entries in entries_by_owner.items()}
+    all_rows = [row for entries in entries_by_owner.values() for _, row, _ in entries]
+    try:
+        digest = structure_bot_ideas(texts_by_owner)
+    except Exception:
+        logger.exception("Сводка идей для бота: сбой Groq")
+        return
+    if not digest:
+        logger.warning("Сводка идей для бота: пустой результат")
+        return
+
+    full_text = "🛠 *Предложения по боту за сегодня:*\n\n" + digest
+    for admin in BOT_ADMIN_OWNERS:
+        chat_id = owner_to_id.get(admin)
+        if not chat_id:
+            continue
+        try:
+            for chunk in split_into_telegram_chunks(full_text):
+                await context.bot.send_message(chat_id=int(chat_id), text=chunk, parse_mode="Markdown")
+        except Exception:
+            logger.exception(f"Сводка идей для бота: не удалось отправить {admin}")
+            return  # не помечаем обработанным — попробуем снова завтра
+
+    mark_entries_processed(get_bot_ideas_sheet(create=False), all_rows)
 
 async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
     """Вечерний чек-лист за сегодня: задачи (с кнопками "Сделано" /
@@ -2131,6 +2242,7 @@ async def main_async():
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, refresh_dashboard_after_update), group=1)
         app.add_handler(CallbackQueryHandler(refresh_dashboard_after_update), group=1)
     app.job_queue.run_daily(run_nightly_job, time=dt_time(hour=16, minute=0, tzinfo=timezone.utc))
+    app.job_queue.run_daily(run_bot_ideas_digest, time=dt_time(hour=16, minute=2, tzinfo=timezone.utc))
     app.job_queue.run_daily(run_evening_checklist, time=dt_time(hour=16, minute=5, tzinfo=timezone.utc))
     app.job_queue.run_repeating(check_reminders, interval=REMINDER_CHECK_INTERVAL, first=10)
     if DASHBOARD_URLS:
