@@ -527,6 +527,21 @@ def move_task_to_date(owner, date_str, row_num, new_date_str):
         add_calendar_event(owner, new_date_str, time_str, task_text, category)
     return task_text
 
+def get_day_candidates(date_str, owner):
+    """Задачи и привычки владельца за конкретный день, в том же виде,
+    что и find_matching_entries — без фильтрации по словам запроса.
+    Используется как запасной вариант, когда удаление просят по одной
+    только дате ("удали 16 ноября"), без описания самой записи: такой
+    запрос не совпадёт по словам ни с одной задачей, хотя день сам по
+    себе понятен и записи на него могут быть."""
+    candidates = []
+    for row_num, row in get_tasks_for_day(date_str, owner):
+        candidates.append(("day", row_num, row[0], row[1]))
+    for row_num, row in get_habits_for_day(date_str, owner):
+        display = f"{row[1]} — {row[2]}" if row[2] else row[1]
+        candidates.append(("day", row_num, row[0], display))
+    return candidates
+
 def find_matching_entries(date_str, owner, query):
     """Найти задачи/привычки за день и цели ВЛАДЕЛЬЦА owner, похожие на
     query, по совпадению слов (без учёта эмодзи/пунктуации). Возвращает
@@ -847,11 +862,19 @@ async def process_text(update, text, owner):
         date_str = parsed.get("date") or today
         query    = parsed.get("task", "")
         matches  = find_matching_entries(date_str, owner, query)
+        fell_back_to_day = False
+        if not matches and parsed.get("date"):
+            # Запрос не совпал по смыслу ни с одной записью — возможно,
+            # в запросе была только дата ("удали 16 ноября") без описания
+            # самой записи. Раз дата понятна, покажем, что вообще есть
+            # в этот день, вместо того чтобы сразу сдаваться.
+            matches = get_day_candidates(date_str, owner)
+            fell_back_to_day = True
         if not matches:
             await update.message.reply_text(
                 f"🤔 Не нашла запись «{query}», чтобы удалить.")
             return
-        if len(matches) == 1:
+        if len(matches) == 1 and not fell_back_to_day:
             kind, row_num, _, entry_text = matches[0]
             if kind == "goal":
                 delete_goal(owner, row_num)
@@ -859,12 +882,13 @@ async def process_text(update, text, owner):
                 delete_entry_from_sheet(date_str, owner, row_num)
             await update.message.reply_text(f"🗑 Удалила: {entry_text}")
             return
+        prompt = ("🤔 Не поняла, какую именно запись удалить — вот что есть "
+                  f"на {date_str}. Какую убрать?") if fell_back_to_day else (
+                  "🤔 Нашла несколько похожих записей. Какую удалить?")
         keyboard = [[InlineKeyboardButton(f"🗑 {entry_text[:45]}",
                      callback_data=f"delpick_{kind}_{date_str}_{row_num}")]
                     for kind, row_num, _, entry_text in matches[:8]]
-        await update.message.reply_text(
-            "🤔 Нашла несколько похожих записей. Какую удалить?",
-            reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(prompt, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if parsed.get("type") == "goal":
