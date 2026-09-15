@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Починила разбор голоса и текста — час назад он был сломан из-за отключённой модели Groq."
+LATEST_CHANGE_NOTE = "«Отметить выполненное» теперь не закрывает список — можно отметить несколько задач подряд. Со скриншота сна «Легла» записывается на предыдущий день, «Встала» — на день скриншота."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -1026,19 +1026,22 @@ def save_health_data(owner, date_str, data):
     Возвращает список строк с тем, что реально записалось (что не
     распозналось на конкретном скрине или привычка была переименована/
     удалена в настройках — просто пропускается)."""
-    def save_habit(keyword, value):
+    def save_habit(keyword, value, day=date_str):
         habit_name = find_habit_name(keyword)
         if not habit_name:
             return None
-        add_task_to_sheet(owner, "", habit_name, value, date_str, "habit")
-        return f"{habit_name}: {value}"
+        add_task_to_sheet(owner, "", habit_name, value, day, "habit")
+        return f"{habit_name}: {value}" + (f" (за {day[:5]})" if day != date_str else "")
 
     saved = []
     if data.get("vstala"):
         line = save_habit("Встала", data["vstala"])
         if line: saved.append(line)
     if data.get("legla"):
-        line = save_habit("Легла", data["legla"])
+        # Сон на скриншоте подписан днём пробуждения: «Встала» и длительность —
+        # за этот день, а «Легла» — вечер накануне (даже если уснула после полуночи).
+        bed_day = (datetime.strptime(date_str, "%d.%m.%Y") - timedelta(days=1)).strftime("%d.%m.%Y")
+        line = save_habit("Легла", data["legla"], bed_day)
         if line: saved.append(line)
     if data.get("son_dlitelnost"):
         line = save_habit("сна", data["son_dlitelnost"])
@@ -1234,16 +1237,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_text(update, text, owner)
 
 async def _remove_checklist_row(query, date_str, row_num):
-    """Убирает из клавиатуры вечернего чек-листа строку кнопок,
-    относящуюся к этой задаче (её уже отметили сделанной или перенесли),
-    оставляя кнопки остальных задач как есть."""
+    """Убирает из клавиатуры (вечернего чек-листа или «Что выполнено?»)
+    строку кнопок, относящуюся к этой задаче (её уже отметили сделанной
+    или перенесли), оставляя кнопки остальных задач как есть. Возвращает
+    оставшиеся строки кнопок."""
     suffix = f"_{date_str}_{row_num}"
     kb = query.message.reply_markup
     if not kb:
-        return
+        return []
     new_rows = [row for row in kb.inline_keyboard
                 if not (row and row[0].callback_data and row[0].callback_data.endswith(suffix))]
     await query.edit_message_reply_markup(InlineKeyboardMarkup(new_rows) if new_rows else None)
+    return new_rows
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
@@ -1271,7 +1276,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = parts[1]
         row_num  = int(parts[2])
         mark_task_done(date_str, owner, row_num)
-        await query.edit_message_text(query.message.text + "\n\n✅ Готово!")
+        # Убираем только нажатую кнопку — остальные задачи можно отмечать
+        # дальше в этом же сообщении, не открывая меню заново.
+        if not await _remove_checklist_row(query, date_str, row_num):
+            await query.edit_message_text("🎉 Все задачи отмечены!")
     elif data.startswith("goaldone_"):
         row_num = int(data.split("_")[1])
         mark_goal_done(owner, row_num)
