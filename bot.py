@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Вечерний чек-лист теперь предлагает заполнить все привычки, которые за день не записаны: витамины — отметить по списку (бот помнит твой набор, надиктовывать его каждый день не нужно), остальное — кнопкой ✏️ вписать значение (время сна, минуты прогулки, воду, настроение). У чтения бот помнит книгу; дочитала — напиши «закончилась»."
+LATEST_CHANGE_NOTE = "Скриншоты сна из Huawei снова распознаются: если распознавалка упёрлась в лимит, бот сам подождёт и повторит, а дату вида 9/15 теперь понимает без переспроса."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -237,26 +237,38 @@ def extract_screenshot_data(image_path):
         "если на экране вообще нет никакого указания на дату/день, оставь null. "
         "Не путай это с временем (ЧЧ:ММ) — здесь нужна именно дата/день."
     )
-    resp = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={**GROQ_HEADERS, "Content-Type": "application/json"},
-        json={
-            "model": "qwen/qwen3.8-27b",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
-                ],
-            }],
-            "max_tokens": 1200,
-            "temperature": 0.1,
-            "response_format": {"type": "json_object"},
-            "reasoning_effort": "none",
-            "reasoning_format": "hidden",
-        },
-        timeout=30,
-    )
+    # Один скриншот — ~2500 входных токенов, а лимит этой модели на
+    # бесплатном тарифе Groq — 7000 в минуту на весь аккаунт: два-три
+    # скриншота подряд (или скриншот сразу после голосовых) упираются в 429.
+    # Groq сам говорит, через сколько секунд можно повторить, — ждём и
+    # пробуем ещё раз, вместо «не удалось распознать».
+    for attempt in range(2):
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={**GROQ_HEADERS, "Content-Type": "application/json"},
+            json={
+                "model": "qwen/qwen3.8-27b",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                    ],
+                }],
+                "max_tokens": 1200,
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+                "reasoning_effort": "none",
+                "reasoning_format": "hidden",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 429 or attempt == 1:
+            break
+        m = re.search(r"try again in ([\d.]+)s", resp.text)
+        delay = float(resp.headers.get("retry-after") or (m.group(1) if m else 20))
+        logger.warning(f"Groq 429 на скриншоте, повтор через {delay:.0f} с")
+        time.sleep(min(max(delay, 1), 40))
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"].strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
@@ -959,6 +971,23 @@ def parse_flexible_date(text, today_dt):
         except ValueError:
             return None
 
+    # «9/15» — так дату пишет Huawei Health (месяц/день). Если в таком
+    # порядке даты не бывает — день/месяц; если подходят оба порядка,
+    # берём тот, что не в будущем (скриншот не может быть из завтра).
+    m = re.search(r"(\d{1,2})/(\d{1,2})(?!/\d)", t)
+    if m:
+        a, b = (int(x) for x in m.groups())
+        candidates = []
+        for month, day in ((a, b), (b, a)):
+            try:
+                candidates.append(datetime(today_dt.year, month, day))
+            except ValueError:
+                pass
+        if not candidates:
+            return None
+        past = [c for c in candidates if c.date() <= today_dt.date()]
+        return (past or candidates)[0].strftime("%d.%m.%Y")
+
     for stem, weekday in RU_WEEKDAYS:
         if stem in t:
             days_ahead = (weekday - today_dt.weekday()) % 7
@@ -1267,10 +1296,17 @@ async def handle_health_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         tmp_path = tmp.name
     await update.message.reply_text("📸 Разбираю скриншот...")
     try:
-        data = extract_screenshot_data(tmp_path)
-    except Exception:
+        # В отдельном потоке: при лимите Groq функция ждёт до 40 секунд
+        # перед повтором — не держим на это время весь бот.
+        data = await asyncio.to_thread(extract_screenshot_data, tmp_path)
+    except Exception as e:
         logger.exception("Screenshot parsing failed")
-        await update.message.reply_text("❌ Не удалось распознать скриншот. Попробуй ещё раз.")
+        if getattr(getattr(e, "response", None), "status_code", None) == 429:
+            await update.message.reply_text(
+                "⏳ Распознавалка скриншотов сейчас упёрлась в лимит запросов в минуту. "
+                "Пришли скриншот ещё раз через минуту.")
+        else:
+            await update.message.reply_text("❌ Не удалось распознать скриншот. Попробуй ещё раз.")
         return
     finally:
         os.unlink(tmp_path)
