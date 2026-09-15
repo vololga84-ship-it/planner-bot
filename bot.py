@@ -22,6 +22,13 @@ load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Короткое описание последнего заметного для пользователей изменения —
+# уходит всем при перезапуске бота вместе с просьбой прислать /start
+# (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
+# который пользователь должен заметить (новая кнопка, починенный баг),
+# не только при чисто технических правках.
+LATEST_CHANGE_NOTE = "Починила разбор голоса и текста — час назад он был сломан из-за отключённой модели Groq."
+
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
 SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID")
@@ -2214,11 +2221,12 @@ async def notify_users_about_restart(app):
     сообщаем всем участникам, что стоит прислать /start: клавиатура с
     кнопками у Telegram кешируется на стороне клиента и не обновится
     сама, если поменялись кнопки или сброшено какое-то состояние."""
+    note = f"\n\nЧто изменилось: {LATEST_CHANGE_NOTE}" if LATEST_CHANGE_NOTE else ""
     for telegram_id in USER_NAMES:
         try:
             await app.bot.send_message(
                 chat_id=int(telegram_id),
-                text="🔄 Бот обновился. Пришли /start, чтобы подтянулись актуальные кнопки.")
+                text=f"🔄 Бот обновился.{note}\n\nПришли /start, чтобы подтянулись актуальные кнопки.")
         except Exception:
             logger.exception(f"Не удалось уведомить о перезапуске: {telegram_id}")
 
