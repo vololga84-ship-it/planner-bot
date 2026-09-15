@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "«Отметить выполненное» больше не пишет «Все задачи выполнены», когда на сегодня задач просто нет, — теперь так и говорит: «задач нет». В вечернем чек-листе у привычек убрала галочки — там просто записанное значение."
+LATEST_CHANGE_NOTE = "Витамины больше не нужно надиктовывать каждый день: бот помнит твой набор и в вечернем чек-листе присылает его кнопками — отметь, что выпила, и нажми «Записать». Поменялся состав или что-то закончилось — надиктуй новый список один раз."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -324,6 +324,77 @@ def find_habit_name(keyword):
         if keyword.lower() in name.lower():
             return name
     return None
+
+# ── Наборы витаминов/БАДов ──────────────────────────────────────
+# Список того, что человек обычно пьёт, запоминается из последнего
+# продиктованного списка через запятую и вечером предлагается кнопками —
+# чтобы не надиктовывать все баночки каждый день. Отметки в чек-листе набор
+# не меняют (пропустила один день — он не пропадёт из набора); поменялся
+# состав или что-то закончилось — надиктовать новый список один раз или
+# поправить строку прямо в листе.
+SUPPLEMENTS_SHEET = "💊 Наборы витаминов"
+
+def is_supplement_habit(habit_name):
+    name = (habit_name or "").lower()
+    return "витамин" in name or "бад" in name
+
+def split_supplements(value):
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+def _get_supplements_sheet(create):
+    sheet = get_sheet()
+    try:
+        return sheet.worksheet(SUPPLEMENTS_SHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        if not create:
+            return None
+        ws = sheet.add_worksheet(title=SUPPLEMENTS_SHEET, rows=50, cols=3)
+        ws.append_row(["Владелец", "Привычка", "Набор (через запятую)"])
+        return ws
+
+def get_supplement_sets():
+    """{(владелец, привычка): [пункты набора]} — одно чтение листа."""
+    ws = _get_supplements_sheet(create=False)
+    if not ws:
+        return {}
+    sets = {}
+    for row in ws.get_all_values()[1:]:
+        owner, habit_name, value = (row + [""] * 3)[:3]
+        if owner and habit_name and split_supplements(value):
+            sets[(owner, habit_name)] = split_supplements(value)
+    return sets
+
+def remember_supplement_set(owner, habit_name, value):
+    """Запоминает продиктованный список как набор. Одиночное значение
+    («приняла», «омега») набором не считается и старый набор не затирает."""
+    if not is_supplement_habit(habit_name) or len(split_supplements(value)) < 2:
+        return
+    ws = _get_supplements_sheet(create=True)
+    normalized = ", ".join(split_supplements(value))
+    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+        if (row + [""] * 2)[:2] == [owner, habit_name]:
+            ws.update(f"C{i}", [[normalized]])
+            return
+    ws.append_row([owner, habit_name, normalized])
+
+def find_recent_supplement_list(owner, habit_name, date_str):
+    """Для тех, у кого набор ещё не запомнен (список диктовали до появления
+    наборов): последний записанный список через запятую за эту и прошлую
+    неделю."""
+    row = habit_row_map().get(habit_name)
+    if not row:
+        return []
+    day = datetime.strptime(date_str, "%d.%m.%Y")
+    for week_day in (day, day - timedelta(days=7)):
+        ws = get_week_sheet(week_day.strftime("%d.%m.%Y"), owner, create=False)
+        if not ws:
+            continue
+        values = (ws.get(f"B{row}:H{row}") or [[]])[0]
+        last_col = min(day.weekday(), 6) if week_day == day else 6
+        for col in range(last_col, -1, -1):
+            if col < len(values) and len(split_supplements(values[col])) >= 2:
+                return split_supplements(values[col])
+    return []
 
 _sheet_cache = {"spreadsheet": None}
 
@@ -885,6 +956,10 @@ async def process_text(update, text, owner):
             await update.message.reply_text(
                 "❌ Не смогла сопоставить привычку с планнером. Попробуй назвать её иначе.")
             return
+        try:
+            remember_supplement_set(owner, parsed.get("habit_name", ""), parsed.get("habit_value", ""))
+        except Exception:
+            logger.exception("Could not remember supplement set")
         await update.message.reply_text(
             f"✅ Привычка: *{parsed.get('habit_name','')}* — {parsed.get('habit_value','')}",
             parse_mode="Markdown")
@@ -1280,6 +1355,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # дальше в этом же сообщении, не открывая меню заново.
         if not await _remove_checklist_row(query, date_str, row_num):
             await query.edit_message_text("🎉 Все задачи отмечены!")
+    elif data.startswith(("vit_", "vitall_")):
+        parts       = data.split("_")
+        date_str    = parts[1]
+        habit_index = int(parts[2])
+        buttons     = _supplement_buttons(query)
+        items       = [btn.text[2:] for btn in buttons]
+        checked     = {i for i, btn in enumerate(buttons) if btn.text.startswith("✅")}
+        if data.startswith("vitall_"):
+            checked = set(range(len(items)))
+        else:
+            checked ^= {int(parts[3])}
+        await query.edit_message_reply_markup(supplement_keyboard(date_str, habit_index, items, checked))
+    elif data.startswith("vitsave_"):
+        _, date_str, habit_str = data.split("_")
+        habit_list = get_habit_list()
+        habit_index = int(habit_str)
+        chosen = [btn.text[2:] for btn in _supplement_buttons(query) if btn.text.startswith("✅")]
+        if habit_index >= len(habit_list):
+            await query.edit_message_text("🤔 Список привычек поменялся — не смогла записать. Надиктуй, что выпила.")
+        elif not chosen:
+            hint = "Ничего не отмечено — отметь, что выпила, и нажми «Записать»."
+            if hint not in query.message.text:
+                await query.edit_message_text(query.message.text + "\n\n" + hint,
+                                              reply_markup=query.message.reply_markup)
+        else:
+            habit_name = habit_list[habit_index]
+            value = ", ".join(chosen)
+            add_task_to_sheet(owner, "", habit_name, value, date_str, "habit")
+            await query.edit_message_text(f"✅ {habit_name} за {date_str[:5]}: {value}")
     elif data.startswith("goaldone_"):
         row_num = int(data.split("_")[1])
         mark_goal_done(owner, row_num)
@@ -1579,6 +1683,10 @@ def _file_parsed_note(owner, parsed, today):
         habit_name  = parsed.get("habit_name") or ""
         habit_value = parsed.get("habit_value") or ""
         add_task_to_sheet(owner, "", habit_name, habit_value, today, "habit")
+        try:
+            remember_supplement_set(owner, habit_name, habit_value)
+        except Exception:
+            logger.exception("Could not remember supplement set")
         return f"😴 {habit_name} — {habit_value}"
     if ptype == "goal":
         period    = parsed.get("period") or "месяц"
@@ -1762,6 +1870,11 @@ async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
         owner_to_id.setdefault(name, telegram_id)
 
     habit_list = get_habit_list()
+    try:
+        supplement_sets = get_supplement_sets()
+    except Exception:
+        logger.exception("Вечерний чек-лист: не удалось прочитать наборы витаминов")
+        supplement_sets = {}
     for owner in ALL_OWNERS:
         chat_id = owner_to_id.get(owner)
         if not chat_id:
@@ -1793,20 +1906,63 @@ async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("✅ Сделано", callback_data=f"evdone_{today}_{row_num}"),
                     InlineKeyboardButton("→ Перенести", callback_data=f"evpost_{today}_{row_num}"),
                 ])
+        # Витамины/БАДы, которые сегодня ещё не записаны, но набор известен, —
+        # предлагаем отдельным сообщением с кнопкой на каждый пункт.
+        supplement_offers = []
+        for habit_index, name in enumerate(habit_list):
+            if name in habits_today or not is_supplement_habit(name):
+                continue
+            items = supplement_sets.get((owner, name))
+            if not items:
+                try:
+                    items = find_recent_supplement_list(owner, name, today)
+                    if items:
+                        remember_supplement_set(owner, name, ", ".join(items))
+                except Exception:
+                    logger.exception(f"Вечерний чек-лист: не удалось найти набор «{name}» для {owner}")
+                    items = []
+            if items:
+                supplement_offers.append((habit_index, name, items))
+        offered_names = {name for _, name, _ in supplement_offers}
+
         if habit_list:
             lines.append("")
             lines.append("😴 *Привычки:*")
             # Привычки не «сделано/не сделано», а значение как есть (время,
             # длительность, список витаминов с дозами) — поэтому без галочек.
             for name in habit_list:
-                lines.append(f"• {name} — {habits_today.get(name, 'не записано')}")
+                if name in offered_names:
+                    lines.append(f"• {name} — отметь ниже 👇")
+                else:
+                    lines.append(f"• {name} — {habits_today.get(name, 'не записано')}")
 
         try:
             await context.bot.send_message(
                 chat_id=int(chat_id), text="\n".join(lines), parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+            for habit_index, name, items in supplement_offers:
+                await context.bot.send_message(
+                    chat_id=int(chat_id), text=f"{name} — что выпила сегодня ({today[:5]})?",
+                    reply_markup=supplement_keyboard(today, habit_index, items))
         except Exception:
             logger.exception(f"Вечерний чек-лист: не удалось отправить {owner}")
+
+def supplement_keyboard(date_str, habit_index, items, checked=()):
+    """Кнопка на каждый пункт набора (нажатие переключает ☐/✅ прямо в
+    сообщении — состояние живёт в самих кнопках, переживает перезапуск
+    бота) + «Все» и «Записать». В callback_data только номера: у Telegram
+    лимит 64 байта, а названия по-русски быстро в него не влезают."""
+    buttons = [InlineKeyboardButton(("✅ " if i in checked else "☐ ") + item,
+                                    callback_data=f"vit_{date_str}_{habit_index}_{i}")
+               for i, item in enumerate(items)]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("☑️ Все", callback_data=f"vitall_{date_str}_{habit_index}"),
+                 InlineKeyboardButton("💾 Записать", callback_data=f"vitsave_{date_str}_{habit_index}")])
+    return InlineKeyboardMarkup(rows)
+
+def _supplement_buttons(query):
+    return [btn for row in query.message.reply_markup.inline_keyboard for btn in row
+            if btn.callback_data and btn.callback_data.startswith("vit_")]
 
 # ── Веб-дашборд (свой сервер на Railway, не claude.ai Artifact) ──
 # Раньше дашборд публиковался как Artifact на claude.ai — оказалось,
