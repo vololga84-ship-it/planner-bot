@@ -178,7 +178,7 @@ def parse_task(text, today, habit_names, owner_names):
         "https://api.groq.com/openai/v1/chat/completions",
         headers={**GROQ_HEADERS, "Content-Type": "application/json"},
         json={
-            "model": "qwen/qwen3.6-27b",
+            "model": "qwen/qwen3.8-27b",
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 300,
             "temperature": 0.1,
@@ -234,7 +234,7 @@ def extract_screenshot_data(image_path):
         "https://api.groq.com/openai/v1/chat/completions",
         headers={**GROQ_HEADERS, "Content-Type": "application/json"},
         json={
-            "model": "qwen/qwen3.6-27b",
+            "model": "qwen/qwen3.8-27b",
             "messages": [{
                 "role": "user",
                 "content": [
