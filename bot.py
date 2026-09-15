@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "«Отметить выполненное» теперь не закрывает список — можно отметить несколько задач подряд. Со скриншота сна «Легла» записывается на предыдущий день, «Встала» — на день скриншота."
+LATEST_CHANGE_NOTE = "«Отметить выполненное» больше не пишет «Все задачи выполнены», когда на сегодня задач просто нет, — теперь так и говорит: «задач нет». В вечернем чек-листе у привычек убрала галочки — там просто записанное значение."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -1351,11 +1351,16 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     owner = owner_for(update)
     today = datetime.now().strftime("%d.%m.%Y")
-    tasks = [(rn, row) for rn, row in get_tasks_for_day(today, owner)
-             if (len(row) < 5 or row[4] != "habit") and
-                (len(row) < 4 or row[3] != "✅")]
+    all_tasks = [(rn, row) for rn, row in get_tasks_for_day(today, owner)
+                 if len(row) < 5 or row[4] != "habit"]
+    tasks = [(rn, row) for rn, row in all_tasks if len(row) < 4 or row[3] != "✅"]
+    if not all_tasks:
+        # Раньше тут было «Все задачи выполнены!» — при пустом дне это
+        # выглядело так, будто бот сам отметил несделанное.
+        await update.effective_message.reply_text(f"📅 На сегодня ({today}) задач нет — отмечать нечего.")
+        return
     if not tasks:
-        await update.effective_message.reply_text("🎉 Все задачи выполнены!")
+        await update.effective_message.reply_text("🎉 Все задачи на сегодня выполнены!")
         return
     keyboard = [[InlineKeyboardButton(f"☐ {row[1][:45]}",
                  callback_data=f"done_{today}_{rn}")] for rn, row in tasks if row[1]]
@@ -1791,11 +1796,10 @@ async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
         if habit_list:
             lines.append("")
             lines.append("😴 *Привычки:*")
+            # Привычки не «сделано/не сделано», а значение как есть (время,
+            # длительность, список витаминов с дозами) — поэтому без галочек.
             for name in habit_list:
-                if name in habits_today:
-                    lines.append(f"✅ {name} — {habits_today[name]}")
-                else:
-                    lines.append(f"➖ {name} — нет данных")
+                lines.append(f"• {name} — {habits_today.get(name, 'не записано')}")
 
         try:
             await context.bot.send_message(
