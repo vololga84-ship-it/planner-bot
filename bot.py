@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Скриншоты сна из Huawei снова распознаются: если распознавалка упёрлась в лимит, бот сам подождёт и повторит, а дату вида 9/15 теперь понимает без переспроса."
+LATEST_CHANGE_NOTE = "Длительность сна теперь спрашиваю как 7:31, а записываю «7 ч 31 мин». У чтения появился объём книги: «20/1084» превращается в «20 страниц из 1084», книгу и объём бот помнит. У воды подписываю миллилитры (стакан = 250 мл), можно отвечать и «1,5 л». Витамины можно вписать списком кнопкой «✏️ список». И если запись не прошла, бот теперь говорит почему."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -832,15 +832,37 @@ pending_health = {}  # user_id -> данные со скриншота "Здор
 pending_postpone = {}  # user_id -> {"date_str", "row_num"}, ждём дату переноса
 pending_habit_value = {}  # user_id -> {"date_str", "habit_name", "book"}, ждём значение привычки из чек-листа
 
+def _short_error(exc):
+    """Короткая понятная причина сбоя для сообщения в чат."""
+    if isinstance(exc, gspread.exceptions.APIError):
+        status = getattr(exc.response, "status_code", None)
+        if status == 429:
+            return "Google Таблицы ответили «слишком много запросов» (квота на минуту)"
+        return f"Google Таблицы ответили ошибкой {status}"
+    text = str(exc).strip().replace("\n", " ")
+    return f"{type(exc).__name__}: {text[:150]}" if text else type(exc).__name__
+
 def habit_value_prompt(habit_name, book=""):
     htype, unit = habit_meta(habit_name)
     lower = habit_name.lower()
-    if is_reading_habit(habit_name):
-        if book:
-            text = (f"{habit_name} — сколько {unit or 'минут'} почитала? Книга: «{book}».\n"
-                    "Дочитала — добавь «закончилась». Начала другую — напиши через запятую: «20, Название».")
+    if is_supplement_habit(habit_name):
+        text = (f"{habit_name} — надиктуй или напиши список через запятую, "
+                "например: «магний-2, хондроитин-1, глутамин-1».\n"
+                "Запомню его и дальше буду предлагать кнопками — каждый день диктовать не придётся.")
+    elif is_duration_habit(habit_name):
+        text = f"{habit_name} — сколько? Например: 7:31."
+    elif "вода" in lower:
+        text = (f"{habit_name} — сколько выпила? Стакан считаю за {GLASS_ML} мл.\n"
+                "Например: «5 стаканов», «1,5 л» или «600 мл».")
+    elif is_reading_habit(habit_name):
+        title, total = parse_book_memory(book)
+        if title:
+            text = (f"{habit_name} — на какой ты странице? Книга: «{title}»"
+                    + (f", всего {total}.\n" if total else ".\n")
+                    + "Например: 45. Другая книга — «45, Название 300 стр». Дочитала — добавь «закончилась».")
         else:
-            text = f"{habit_name} — сколько {unit or 'минут'} почитала и какую книгу? Например: «20, Мастер и Маргарита»."
+            text = (f"{habit_name} — сколько страниц и какая книга? "
+                    "Например: «45, Мастер и Маргарита 500 стр» или «45/500».")
     elif "прогулк" in lower:
         text = f"{habit_name} — сколько прошла? Например: «40 мин, 6000 шагов, 4 км»."
     elif htype == "время":
@@ -852,10 +874,41 @@ def habit_value_prompt(habit_name, book=""):
         text = f"{habit_name} — сколько{f' ({unit})' if unit else ''}?"
     return text + "\n\nНапиши или надиктуй. Передумала — «отмена»."
 
+def is_duration_habit(habit_name):
+    return "длительн" in (habit_name or "").lower() or habit_meta(habit_name)[1] == "часов"
+
+def normalize_duration(text):
+    """«7:31», «7 часов 1 минута», «7ч31м», «7» -> «7 ч 31 мин» — один вид
+    и в таблице, и в дашборде, как бы ни надиктовали."""
+    t = (text or "").strip().lower()
+    m = re.search(r"(\d{1,2})\s*[:.]\s*(\d{1,2})", t)
+    if m:
+        hours, minutes = int(m.group(1)), int(m.group(2))
+        # «7.5» — это семь с половиной часов, а не 7 ч 5 мин.
+        if "." in m.group(0) and len(m.group(2)) == 1:
+            minutes = int(m.group(2)) * 6
+    elif re.search(r"(\d{1,2})\s*ч(?:ас\w*)?\s*(\d{1,2})?", t):
+        m = re.search(r"(\d{1,2})\s*ч(?:ас\w*)?\s*(\d{1,2})?", t)
+        hours, minutes = int(m.group(1)), int(m.group(2) or 0)
+    else:
+        m = re.search(r"(\d{1,2})", t)
+        if not m:
+            return None
+        hours, minutes = int(m.group(1)), 0
+    if hours > 23 or minutes > 59:
+        return None
+    return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+
 def normalize_habit_value(habit_name, text):
     """Значение для записи в таблицу или None, если ответ не подходит
     (время без ЧЧ:ММ, число без единой цифры)."""
     text = (text or "").strip()
+    if is_supplement_habit(habit_name):
+        return ", ".join(split_supplements(text)) or None
+    if is_duration_habit(habit_name):
+        return normalize_duration(text)
+    if "вода" in habit_name.lower():
+        return normalize_water(text)
     if habit_meta(habit_name)[0] == "время":
         m = re.search(r"(\d{1,2})[:.\s](\d{2})\b", text)
         if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
@@ -863,16 +916,62 @@ def normalize_habit_value(habit_name, text):
         return f"{int(m.group(1)):02d}:{m.group(2)}"
     return text if re.search(r"\d", text) else None
 
-def apply_reading_answer(text, current_book):
-    """«20» / «20, Новая книга» / «20, закончилась» -> (значение для таблицы,
-    книга, которую помнить дальше; пусто — дочитала)."""
+GLASS_ML = 250  # столько считаем в одном стакане воды
+
+def normalize_water(text):
+    """«5 стаканов» / «1,5 л» / «600 мл» -> «5 ст (1250 мл)» — чтобы в
+    дашборде было видно не только число стаканов, но и сколько это в мл."""
+    t = (text or "").lower().replace(",", ".")
+    m = re.search(r"(\d+(?:\.\d+)?)", t)
+    if not m:
+        return None
+    number = float(m.group(1))
+    if re.search(r"\bмл\b|миллилитр", t):
+        millilitres = number
+    elif re.search(r"\bл\b|литр", t):
+        millilitres = number * 1000
+    else:
+        millilitres = number * GLASS_ML
+    glasses = millilitres / GLASS_ML
+    fmt = lambda x: f"{x:.1f}".rstrip("0").rstrip(".")
+    return f"{fmt(glasses)} ст ({fmt(millilitres)} мл)"
+
+def parse_book_memory(remembered):
+    """«Название|1084» -> ("Название", "1084")."""
+    book, _, total = (remembered or "").partition("|")
+    return book.strip(), total.strip()
+
+def apply_reading_answer(text, remembered):
+    """«45» / «45/1084» / «45, Название 1084 стр» / «45, закончилась» ->
+    (значение для таблицы, что помнить дальше). Общий объём книги
+    запоминается вместе с названием, чтобы виден был прогресс."""
+    book, total = parse_book_memory(remembered)
     finished = bool(re.search(r"законч|дочитал", text, re.IGNORECASE))
     parts = [p.strip(" .") for p in text.split(",")]
     parts = [p for p in parts if p and not re.search(r"законч|дочитал", p, re.IGNORECASE)]
-    amount = parts[0] if parts else ""
-    book = ", ".join(parts[1:]) or current_book
-    value = amount + (f" — «{book}»" if book else "") + (" (закончилась)" if finished else "")
-    return value, ("" if finished else book)
+    first = parts[0] if parts else ""
+    title = ", ".join(parts[1:]).strip()
+    if title:
+        # «Седьмой 1084 стр» — объём книги пишут прямо в названии.
+        m = re.search(r"(\d{2,5})\s*(?:стр\w*|с\.)", title)
+        title_total = ""
+        if m:
+            title_total = m.group(1)
+            title = title.replace(m.group(0), "")
+        title = re.sub(r"\(\s*\)", "", title).strip(" ,.()")
+        # Назвали другую книгу — объём прошлой не наследуем.
+        if title_total or title != book:
+            total = title_total
+        book = title
+    m = re.search(r"(\d+)\s*/\s*(\d+)", first)
+    if m:
+        pages, total = m.group(1), m.group(2)
+    else:
+        m = re.search(r"(\d+)", first)
+        pages = m.group(1) if m else ""
+    value = f"{pages} страниц" + (f" из {total}" if total else "")
+    value += (f" — «{book}»" if book else "") + (" (закончилась)" if finished else "")
+    return value, ("" if finished else (f"{book}|{total}" if book else ""))
 
 async def consume_pending_habit_value(update, text, owner):
     """Если ждём значение привычки (нажали «✏️» в вечернем чек-листе) —
@@ -891,6 +990,8 @@ async def consume_pending_habit_value(update, text, owner):
     if not value:
         if habit_meta(habit_name)[0] == "время":
             await update.message.reply_text("🤔 Не поняла время. Напиши, например, 23:40 — или «отмена».")
+        elif is_duration_habit(habit_name):
+            await update.message.reply_text("🤔 Не поняла, сколько это. Напиши, например, 7:31 — или «отмена».")
         else:
             await update.message.reply_text("🤔 Нужно число, например «20» или «40 мин» — или «отмена».")
         return True
@@ -901,9 +1002,18 @@ async def consume_pending_habit_value(update, text, owner):
         add_task_to_sheet(owner, "", habit_name, value, entry["date_str"], "habit")
         if next_book is not None and next_book != entry.get("book", ""):
             remember_value(owner, habit_name, next_book)
-    except Exception:
+        if is_supplement_habit(habit_name):
+            remember_supplement_set(owner, habit_name, value)
+    except Exception as exc:
+        # Значение ждём дальше — чтобы не пришлось искать кнопку заново.
+        # Без этой подсказки следующее сообщение (например, список витаминов)
+        # бот примет за ответ на этот вопрос.
         logger.exception("Could not save habit value from checklist")
-        await update.message.reply_text("❌ Не смогла записать в планнер. Попробуй ещё раз.")
+        # Причину показываем прямо в чате: логов Railway под рукой обычно
+        # нет, а без них непонятно, это квота Google, сеть или что-то ещё.
+        await update.message.reply_text(
+            f"❌ Не записала «{habit_name}»: {_short_error(exc)}\n"
+            "Пришли значение ещё раз — или напиши «отмена».")
         return True
     pending_habit_value.pop(user_id, None)
     await update.message.reply_text(f"✅ {habit_name} за {entry['date_str'][:5]}: {value}")
@@ -1264,7 +1374,7 @@ def save_health_data(owner, date_str, data):
         line = save_habit("Легла", data["legla"], bed_day)
         if line: saved.append(line)
     if data.get("son_dlitelnost"):
-        line = save_habit("сна", data["son_dlitelnost"])
+        line = save_habit("сна", normalize_duration(data["son_dlitelnost"]) or data["son_dlitelnost"])
         if line: saved.append(line)
 
     walk_parts = []
@@ -2116,8 +2226,13 @@ async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
             if len(items) >= 2:
                 supplement_offers.append((habit_index, name, items))
             elif is_tick_habit(name):
-                fill_rows.append([InlineKeyboardButton(f"{name} ✓", callback_data=f"hyes_{today}_{habit_index}"),
-                                  InlineKeyboardButton("✗", callback_data=f"hno_{today}_{habit_index}")])
+                row = [InlineKeyboardButton(f"{name} ✓", callback_data=f"hyes_{today}_{habit_index}"),
+                       InlineKeyboardButton("✗", callback_data=f"hno_{today}_{habit_index}")]
+                if is_supplement_habit(name):
+                    # Набора ещё нет — даём вписать список, чтобы завтра он
+                    # пришёл кнопками по пунктам.
+                    row.append(InlineKeyboardButton("✏️ список", callback_data=f"hval_{today}_{habit_index}"))
+                fill_rows.append(row)
             else:
                 fill_rows.append([InlineKeyboardButton(f"✏️ {name}", callback_data=f"hval_{today}_{habit_index}")])
 
@@ -2203,23 +2318,26 @@ def build_dashboard_data(owner):
 
     try:
         ws = sheet.worksheet(week_sheet_name(today_str, owner))
-        for d in week_dates:
-            column = day_column(d)
-            values = ws.get(f"{column}5:{column}24")
+        # Одним запросом весь блок недели (задачи + привычки): раньше это
+        # были восемь отдельных чтений на каждое обновление дашборда, а он
+        # обновляется после каждого сообщения — и упирался в квоту Google,
+        # из-за чего падали соседние записи.
+        block = ws.get(f"B5:H{HABIT_START_ROW + HABIT_MAX_ROWS - 1}")
+        def cell(row_num, day_index):
+            row = block[row_num - 5] if row_num - 5 < len(block) else []
+            return row[day_index] if day_index < len(row) else ""
+        for day_index, d in enumerate(week_dates):
             day_tasks = []
             for category, (start_row, end_row, label) in CATEGORY_ROWS.items():
                 for row_num in range(start_row, end_row + 1):
-                    offset = row_num - 5
-                    value = values[offset][0] if offset < len(values) and values[offset] else ""
+                    value = cell(row_num, day_index)
                     if value:
                         status = "✅" if value.startswith("✅") else "☐"
                         day_tasks.append({"category": label, "text": value.lstrip("☐✅ ").strip(), "status": status})
             week[d] = day_tasks
-        habit_values = ws.get(f"A{HABIT_START_ROW}:H{HABIT_START_ROW + HABIT_MAX_ROWS - 1}")
         for i, name in enumerate(habit_list):
-            row = habit_values[i] if i < len(habit_values) else []
-            for j, d in enumerate(week_dates):
-                val = row[1 + j] if 1 + j < len(row) else ""
+            for day_index, d in enumerate(week_dates):
+                val = cell(HABIT_START_ROW + i, day_index)
                 if val:
                     habits[name][d] = val
     except gspread.exceptions.WorksheetNotFound:
@@ -2531,18 +2649,41 @@ async def refresh_dashboard_cache(owner):
     try:
         data = await asyncio.to_thread(build_dashboard_data, owner)
         DASHBOARD_CACHE[owner] = render_dashboard_page(owner, data)
+        _dashboard_last_refresh[owner] = time.time()
     except Exception:
         logger.exception(f"Не удалось обновить дашборд для {owner}")
 
+DASHBOARD_MIN_INTERVAL = 90  # секунд между пересборками по сообщениям
+_dashboard_last_refresh = {}  # owner -> когда собирали в последний раз
+_dashboard_refresh_queued = set()
+
 def schedule_dashboard_refresh(owner):
     """Фоновое обновление кэша дашборда — вызывается после действий,
-    которые могли что-то поменять (не блокирует ответ пользователю)."""
-    if owner not in DASHBOARD_URLS:
+    которые могли что-то поменять (не блокирует ответ пользователю).
+
+    Не чаще раза в DASHBOARD_MIN_INTERVAL: пересборка стоит десяток
+    чтений Google Sheets, а при быстром заполнении привычек сообщения
+    идут одно за другим — так бот сам выбирал квоту и ронял соседние
+    записи. Если за это время что-то поменялось ещё раз, обновление не
+    теряется: одна отложенная пересборка соберёт всё сразу."""
+    if owner not in DASHBOARD_URLS or owner in _dashboard_refresh_queued:
         return
     try:
-        asyncio.get_running_loop().create_task(refresh_dashboard_cache(owner))
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        pass
+        return
+    wait = DASHBOARD_MIN_INTERVAL - (time.time() - _dashboard_last_refresh.get(owner, 0))
+
+    async def refresh_later():
+        try:
+            if wait > 0:
+                await asyncio.sleep(wait)
+            await refresh_dashboard_cache(owner)
+        finally:
+            _dashboard_refresh_queued.discard(owner)
+
+    _dashboard_refresh_queued.add(owner)
+    loop.create_task(refresh_later())
 
 async def refresh_all_dashboards(context: ContextTypes.DEFAULT_TYPE):
     for owner in DASHBOARD_URLS:
