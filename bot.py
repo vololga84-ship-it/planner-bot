@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Длительность сна теперь спрашиваю как 7:31, а записываю «7 ч 31 мин». У чтения появился объём книги: «20/1084» превращается в «20 страниц из 1084», книгу и объём бот помнит. У воды подписываю миллилитры (стакан = 250 мл), можно отвечать и «1,5 л». Витамины можно вписать списком кнопкой «✏️ список». И если запись не прошла, бот теперь говорит почему."
+LATEST_CHANGE_NOTE = "Когда бот спрашивает значение привычки, он теперь прямо называет формат ответа — «Формат ответа: ЧЧ:ММ, например 23:40». Если ответ не понят, вопрос с форматом повторяется."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -843,36 +843,54 @@ def _short_error(exc):
     return f"{type(exc).__name__}: {text[:150]}" if text else type(exc).__name__
 
 def habit_value_prompt(habit_name, book=""):
+    """Вопрос об одном значении. Формат всегда называем прямо («Формат:
+    Ч:ММ»), а не намёком: участников трое, отвечают все по-разному, и
+    без явного формата бот половину ответов не понимает."""
     htype, unit = habit_meta(habit_name)
     lower = habit_name.lower()
     if is_supplement_habit(habit_name):
-        text = (f"{habit_name} — надиктуй или напиши список через запятую, "
-                "например: «магний-2, хондроитин-1, глутамин-1».\n"
-                "Запомню его и дальше буду предлагать кнопками — каждый день диктовать не придётся.")
+        question = f"{habit_name} — что выпила?"
+        fmt = "список через запятую, например «магний-2, хондроитин-1, глутамин-1»"
+        extra = "Запомню список и дальше буду предлагать его кнопками — диктовать каждый день не придётся."
     elif is_duration_habit(habit_name):
-        text = f"{habit_name} — сколько? Например: 7:31."
+        question = f"{habit_name} — сколько спала?"
+        fmt = "Ч:ММ, например 7:31 (7 часов 31 минута)"
+        extra = ""
     elif "вода" in lower:
-        text = (f"{habit_name} — сколько выпила? Стакан считаю за {GLASS_ML} мл.\n"
-                "Например: «5 стаканов», «1,5 л» или «600 мл».")
+        question = f"{habit_name} — сколько выпила?"
+        fmt = "число стаканов, например 5"
+        extra = f"Стакан считаю за {GLASS_ML} мл. Можно и так: «1,5 л», «600 мл»."
     elif is_reading_habit(habit_name):
         title, total = parse_book_memory(book)
-        if title:
-            text = (f"{habit_name} — на какой ты странице? Книга: «{title}»"
-                    + (f", всего {total}.\n" if total else ".\n")
-                    + "Например: 45. Другая книга — «45, Название 300 стр». Дочитала — добавь «закончилась».")
+        question = f"{habit_name} — сколько страниц прочитала?"
+        if title and total:
+            fmt = f"число страниц, например 45 (книга «{title}», всего {total})"
+        elif title:
+            fmt = f"страницы/всего, например 45/300 (книга «{title}»)"
         else:
-            text = (f"{habit_name} — сколько страниц и какая книга? "
-                    "Например: «45, Мастер и Маргарита 500 стр» или «45/500».")
+            fmt = "страницы/всего, например 45/300"
+        extra = "Другая книга — «45, Название 300 стр». Дочитала — добавь «закончилась»."
     elif "прогулк" in lower:
-        text = f"{habit_name} — сколько прошла? Например: «40 мин, 6000 шагов, 4 км»."
+        question = f"{habit_name} — сколько прошла?"
+        fmt = "число минут, например 40"
+        extra = "Можно добавить шаги и километры: «40 мин, 6000 шагов, 4 км»."
     elif htype == "время":
-        example = "07:30" if "встал" in lower else "23:40"
-        text = f"{habit_name} — во сколько? Например: {example}."
+        question = f"{habit_name} — во сколько?"
+        fmt = "ЧЧ:ММ, например " + ("07:30" if "встал" in lower else "23:40")
+        extra = ""
     elif unit == "1-10":
-        text = f"{habit_name} — от 1 до 10?"
+        question = f"{habit_name} — как оценишь?"
+        fmt = "число от 1 до 10, например 7"
+        extra = ""
     else:
-        text = f"{habit_name} — сколько{f' ({unit})' if unit else ''}?"
-    return text + "\n\nНапиши или надиктуй. Передумала — «отмена»."
+        question = f"{habit_name} — сколько?"
+        fmt = f"число{f' ({unit})' if unit else ''}, например 5"
+        extra = ""
+    lines = [question, f"Формат ответа: {fmt}."]
+    if extra:
+        lines.append(extra)
+    lines.append("Можно написать или надиктовать. Передумала — «отмена».")
+    return "\n".join(lines)
 
 def is_duration_habit(habit_name):
     return "длительн" in (habit_name or "").lower() or habit_meta(habit_name)[1] == "часов"
@@ -988,12 +1006,9 @@ async def consume_pending_habit_value(update, text, owner):
     habit_name = entry["habit_name"]
     value = normalize_habit_value(habit_name, text)
     if not value:
-        if habit_meta(habit_name)[0] == "время":
-            await update.message.reply_text("🤔 Не поняла время. Напиши, например, 23:40 — или «отмена».")
-        elif is_duration_habit(habit_name):
-            await update.message.reply_text("🤔 Не поняла, сколько это. Напиши, например, 7:31 — или «отмена».")
-        else:
-            await update.message.reply_text("🤔 Нужно число, например «20» или «40 мин» — или «отмена».")
+        # Повторяем ровно тот же вопрос с форматом — так понятнее, чем
+        # отдельная фраза про ошибку.
+        await update.message.reply_text("🤔 Не поняла ответ.\n\n" + habit_value_prompt(habit_name, entry.get("book", "")))
         return True
     next_book = None
     if is_reading_habit(habit_name):
