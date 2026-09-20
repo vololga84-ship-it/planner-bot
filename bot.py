@@ -5,7 +5,8 @@
 """
 
 import os, re, time, logging, json, tempfile, base64, asyncio, requests
-from datetime import datetime, timedelta, timezone, time as dt_time
+from datetime import datetime, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Бот стал понимать английский вперемешку с русским: распознавание голоса пишет английские слова латиницей («прескул» превращается в preschool), понимаются today/tomorrow, дни недели и даты вида «15 September», а категорию можно назвать словом work, home или personal. Свои английские слова можно дописать в лист «🧠 Бот помнит», строка «🗣 Английские слова»."
+LATEST_CHANGE_NOTE = "Теперь у каждой своё время: вечерний чек-лист приходит в 21:05 по её местному времени, а не по времени сервера, и «сегодня» тоже считается по её поясу — ночные записи больше не уходят во вчерашний день."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -58,6 +59,26 @@ DASHBOARD_URLS = _parse_owner_map(os.getenv("DASHBOARD_URLS"))
 # таблица.
 CALENDAR_IDS = _parse_owner_map(os.getenv("CALENDAR_IDS"))
 CALENDAR_TIMEZONE = os.getenv("CALENDAR_TIMEZONE", "Asia/Yekaterinburg")
+# TIMEZONES=Оля:Asia/Yekaterinburg,Юля:Africa/Johannesburg — участники живут в
+# разных странах, поэтому "сегодня", напоминания и вечерние задания считаются
+# по местному времени каждой, а не по времени сервера (оно на Railway в UTC).
+TIMEZONES = _parse_owner_map(os.getenv("TIMEZONES"))
+DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", CALENDAR_TIMEZONE)
+
+def tz_for(owner):
+    try:
+        return ZoneInfo(TIMEZONES.get(owner) or DEFAULT_TIMEZONE)
+    except Exception:
+        logger.exception(f"Неизвестный часовой пояс у {owner}")
+        return ZoneInfo("UTC")
+
+def now_for(owner):
+    """Местное время участника, без привязки к поясу — весь остальной код
+    работает с наивными датами."""
+    return datetime.now(tz_for(owner)).replace(tzinfo=None)
+
+def today_for(owner):
+    return now_for(owner).strftime("%d.%m.%Y")
 
 def _parse_users(raw):
     """USERS=182778711:Оля,555555555:Мама:Лена — Telegram ID -> (имя
@@ -192,7 +213,6 @@ def explicit_category(text):
 
 def parse_task(text, today, habit_names, owner_names, glossary=""):
     """Понять задачу через Groq LLaMA."""
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
     habit_list_str = ", ".join(f'"{name}"' for name in habit_names)
     owners_list_str = ", ".join(f'"{name}"' for name in owner_names) or "нет других участников"
     glossary_hint = (f"\nЭтот участник часто вставляет английские слова: {glossary}. "
@@ -834,7 +854,7 @@ def _get_or_create_log_sheet(title, create):
 
 def _append_log_row(title, owner, text):
     ws = _get_or_create_log_sheet(title, create=True)
-    now = datetime.now()
+    now = now_for(owner)
     ws.append_row([now.strftime("%d.%m.%Y"), now.strftime("%H:%M"), owner, text, "новая"])
 
 def get_ideas_sheet(create=False):
@@ -1275,7 +1295,7 @@ async def send_peek(update, target_owner, date_str):
 # ── Process text/voice ─────────────────────────────────────────
 async def process_text(update, text, owner):
     user_id = str(update.effective_user.id)
-    today   = datetime.now().strftime("%d.%m.%Y")
+    today   = today_for(owner)
     try:
         parsed = parse_task(text, today, get_habit_list(), ALL_OWNERS, get_glossary(owner))
     except Exception:
@@ -1541,7 +1561,7 @@ async def handle_health_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"📝 Записала текст со скриншота в заметки:\n\n{text}")
         return
 
-    date_str = parse_flexible_date(data.get("data_na_ekrane"), datetime.now())
+    date_str = parse_flexible_date(data.get("data_na_ekrane"), now_for(owner))
     if not date_str:
         pending_health[user_id] = data
         await update.message.reply_text(
@@ -1562,12 +1582,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     owner   = owner_for(update)
     text    = (update.message.text or "").strip()
-    today   = datetime.now().strftime("%d.%m.%Y")
+    today   = today_for(owner)
 
     # Ждём уточнение даты для скриншота "Здоровья" — этот ответ не должен
     # попасть ни в режимы заметок, ни в разбор задачи.
     if user_id in pending_health:
-        date_str = parse_flexible_date(text, datetime.now())
+        date_str = parse_flexible_date(text, now_for(owner))
         if not date_str:
             await update.message.reply_text(
                 "🤔 Не поняла дату. Напиши, например «вторник», «сегодня», «вчера» или 13.09.")
@@ -1584,7 +1604,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Ждём дату для переноса задачи из вечернего чек-листа.
     if user_id in pending_postpone:
-        date_str = parse_flexible_date(text, datetime.now())
+        date_str = parse_flexible_date(text, now_for(owner))
         if not date_str:
             await update.message.reply_text(
                 "🤔 Не поняла дату. Напиши, например «вторник», «20.09» или «завтра».")
@@ -1669,7 +1689,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user_id in user_states and user_states[user_id].get("awaiting_date"):
-        date_str = parse_flexible_date(text, datetime.now())
+        date_str = parse_flexible_date(text, now_for(owner))
         if not date_str:
             await update.message.reply_text(
                 "🤔 Не поняла дату. Напиши, например «вторник», «20.09» или «завтра».")
@@ -1711,7 +1731,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     owner   = owner_for(update)
     data    = query.data
-    today   = datetime.now().strftime("%d.%m.%Y")
+    today   = today_for(owner)
     if data.startswith("cat_"):
         category = data.replace("cat_", "")
         if user_id in user_states:
@@ -1838,7 +1858,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     owner = owner_for(update)
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = today_for(owner)
     tasks = get_tasks_for_day(today, owner)
     if not tasks:
         await update.effective_message.reply_text(f"📅 На {today} задач нет.\n\nНаговори что-нибудь! 🎤")
@@ -1855,7 +1875,7 @@ async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     owner = owner_for(update)
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = today_for(owner)
     all_tasks = [(rn, row) for rn, row in get_tasks_for_day(today, owner)
                  if len(row) < 5 or row[4] != "habit"]
     tasks = [(rn, row) for rn, row in all_tasks if len(row) < 4 or row[3] != "✅"]
@@ -1877,7 +1897,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def habits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     owner  = owner_for(update)
-    today  = datetime.now().strftime("%d.%m.%Y")
+    today  = today_for(owner)
     habits = get_habits_for_day(today, owner)
     if not habits:
         await update.effective_message.reply_text(
@@ -1972,7 +1992,6 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Каждые REMINDER_CHECK_INTERVAL секунд смотрит задачи с указанным
     временем на сегодня и на завтра и шлёт напоминание за час и за сутки
     до момента задачи (владельцу этой задачи, не всем)."""
-    now = datetime.now()
     owner_to_id = {}
     for telegram_id, name in USER_NAMES.items():
         owner_to_id.setdefault(name, telegram_id)
@@ -1981,6 +2000,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         chat_id = owner_to_id.get(owner)
         if not chat_id:
             continue
+        now = now_for(owner)
         for days_ahead, minutes_before, kind, prefix in REMINDER_RULES:
             date_str = (now + timedelta(days=days_ahead)).strftime("%d.%m.%Y")
             try:
@@ -2135,9 +2155,12 @@ async def run_nightly_job(context: ContextTypes.DEFAULT_TYPE):
     for telegram_id, name in USER_NAMES.items():
         owner_to_id.setdefault(name, telegram_id)
     habit_names = get_habit_list()
-    today = datetime.now().strftime("%d.%m.%Y")
+    only_owner = context.job.data if context.job else None
 
     for owner, entries in by_owner.items():
+        if only_owner and owner != only_owner:
+            continue
+        today = today_for(owner)
         taken = entries[:MAX_NOTES_PER_OWNER_PER_NIGHT]
         chat_id = owner_to_id.get(owner)
         if not chat_id:
@@ -2265,7 +2288,7 @@ async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
     """Вечерний чек-лист за сегодня: задачи (с кнопками "Сделано" /
     "Перенести" у невыполненных) и привычки (только информационно —
     привычку на завтра не перенесёшь, не отмечена — значит не сделана)."""
-    today = datetime.now().strftime("%d.%m.%Y")
+    only_owner = context.job.data if context.job else None
     owner_to_id = {}
     for telegram_id, name in USER_NAMES.items():
         owner_to_id.setdefault(name, telegram_id)
@@ -2278,8 +2301,9 @@ async def run_evening_checklist(context: ContextTypes.DEFAULT_TYPE):
         remembered = {}
     for owner in ALL_OWNERS:
         chat_id = owner_to_id.get(owner)
-        if not chat_id:
+        if not chat_id or (only_owner and owner != only_owner):
             continue
+        today = today_for(owner)
         try:
             tasks = [(rn, row) for rn, row in get_tasks_for_day(today, owner)
                      if len(row) < 5 or row[4] != "habit"]
@@ -2408,7 +2432,7 @@ def build_dashboard_data(owner):
     """Синхронно (gspread) собирает те же данные, что раньше собирались
     вручную для Artifact: задачи на неделю, привычки, цели, очередь
     заметок/идей. Вызывать через asyncio.to_thread — блокирующий I/O."""
-    today_dt   = datetime.now()
+    today_dt   = now_for(owner)
     today_str  = today_dt.strftime("%d.%m.%Y")
     monday     = week_start(today_str)
     week_dates = [(monday + timedelta(days=i)).strftime("%d.%m.%Y") for i in range(7)]
@@ -2859,9 +2883,17 @@ async def main_async():
         app.add_handler(MessageHandler(filters.PHOTO, refresh_dashboard_after_update), group=1)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, refresh_dashboard_after_update), group=1)
         app.add_handler(CallbackQueryHandler(refresh_dashboard_after_update), group=1)
-    app.job_queue.run_daily(run_nightly_job, time=dt_time(hour=16, minute=0, tzinfo=timezone.utc))
-    app.job_queue.run_daily(run_bot_ideas_digest, time=dt_time(hour=16, minute=2, tzinfo=timezone.utc))
-    app.job_queue.run_daily(run_evening_checklist, time=dt_time(hour=16, minute=5, tzinfo=timezone.utc))
+    # Вечерние задания — у каждой в её 21:00–21:05 по местному времени:
+    # Екатеринбург и Йоханнесбург это разные моменты по UTC, а раньше
+    # расписание было одно на всех и жило по времени сервера.
+    for owner in ALL_OWNERS:
+        owner_tz = tz_for(owner)
+        app.job_queue.run_daily(run_nightly_job, time=dt_time(hour=21, minute=0, tzinfo=owner_tz),
+                                data=owner, name=f"nightly-{owner}")
+        app.job_queue.run_daily(run_evening_checklist, time=dt_time(hour=21, minute=5, tzinfo=owner_tz),
+                                data=owner, name=f"checklist-{owner}")
+        logger.info(f"⏰ {owner}: вечерние задания в 21:00/21:05 по {TIMEZONES.get(owner, DEFAULT_TIMEZONE)}")
+    app.job_queue.run_daily(run_bot_ideas_digest, time=dt_time(hour=21, minute=2, tzinfo=ZoneInfo(DEFAULT_TIMEZONE)))
     app.job_queue.run_repeating(check_reminders, interval=REMINDER_CHECK_INTERVAL, first=10)
     if DASHBOARD_URLS:
         app.job_queue.run_repeating(refresh_all_dashboards, interval=300, first=15)
