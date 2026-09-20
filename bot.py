@@ -2042,12 +2042,20 @@ NIGHT_AGENT_MODEL = "openai/gpt-oss-120b"
 MAX_NOTES_PER_OWNER_PER_NIGHT = 40
 TELEGRAM_MSG_LIMIT = 4096
 
-def structure_notes_for_owner(owner, notes):
+def structure_notes_for_owner(owner, notes, glossary=""):
     """Причёсывает то, что НЕ разошлось по задачам/привычкам/целям
     (см. run_nightly_job), в результат нужной формы. Форму (план,
     черновик письма, список и т.п.) выбирает сама модель по смыслу.
     Возвращает готовый текст или None, если модель ничего не вернула."""
     notes_block = "\n".join(f"{i}. {text}" for i, text in enumerate(notes, 1))
+    # Часть участников вставляет в русскую речь английские слова, и
+    # расшифровка голоса пишет их кириллицей («прескул»). Здесь, как и в
+    # parse_task, даём модели список таких слов, чтобы она вернула нормальное
+    # написание вместо пометки «не расслышала».
+    glossary_rule = (f" ВАЖНО: этот человек вставляет в русскую речь английские слова — {glossary}. "
+                     "Расшифровка голоса пишет их кириллицей («прескул», «плейграунд»). "
+                     "КАЖДОЕ такое слово возвращай латиницей (preschool, playground) — "
+                     "везде, где оно встречается, и не помечай его как плохо расслышанное.") if glossary else ""
     resp = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={**GROQ_HEADERS, "Content-Type": "application/json"},
@@ -2069,7 +2077,7 @@ def structure_notes_for_owner(owner, notes):
                     "повторяющейся теме, для которой в планнере нет своего места "
                     "(не задача, не цель, не привычка) — можешь одной строкой "
                     "предложить завести под неё отдельный раздел, не более. "
-                    "Пиши по-русски, обращайся на «ты»."
+                    "Пиши по-русски, обращайся на «ты»." + glossary_rule
                 )},
                 {"role": "user", "content": f"Заметки {owner} за сегодня:\n{notes_block}"},
             ],
@@ -2186,7 +2194,7 @@ async def run_nightly_job(context: ContextTypes.DEFAULT_TYPE):
         leftover_result = None
         if leftover_texts:
             try:
-                leftover_result = structure_notes_for_owner(owner, leftover_texts)
+                leftover_result = structure_notes_for_owner(owner, leftover_texts, get_glossary(owner))
             except Exception:
                 logger.exception(f"Ночной агент: сбой Groq (общий текст) для {owner}")
 
