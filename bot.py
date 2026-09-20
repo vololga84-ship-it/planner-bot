@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Когда бот спрашивает значение привычки, он теперь прямо называет формат ответа — «Формат ответа: ЧЧ:ММ, например 23:40». Если ответ не понят, вопрос с форматом повторяется."
+LATEST_CHANGE_NOTE = "Бот стал понимать английский вперемешку с русским: распознавание голоса пишет английские слова латиницей («прескул» превращается в preschool), понимаются today/tomorrow, дни недели и даты вида «15 September», а категорию можно назвать словом work, home или personal. Свои английские слова можно дописать в лист «🧠 Бот помнит», строка «🗣 Английские слова»."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -145,32 +145,71 @@ GROQ_HEADERS = {
     "Authorization": f"Bearer {GROQ_API_KEY}",
 }
 
-def transcribe_voice(file_path):
-    """Расшифровка голоса через Groq Whisper."""
+def transcribe_voice(file_path, glossary=""):
+    """Расшифровка голоса через Groq Whisper.
+
+    glossary — слова, которые участник обычно говорит по-английски посреди
+    русской речи (preschool, playdate...). Whisper принимает их подсказкой
+    и пишет латиницей, а не «прескул»: без подсказки смешанная речь
+    расслышивается по-русски и слово потом не найти ни глазами, ни поиском."""
+    hint = ""
+    if glossary:
+        hint = ("Речь смешивает русский и английский. Английские слова и имена пиши латиницей: "
+                f"{glossary}.")
+    data = {"model": "whisper-large-v3", "response_format": "text"}
+    if hint:
+        data["prompt"] = hint
     with open(file_path, "rb") as f:
         resp = requests.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             headers=GROQ_HEADERS,
             files={"file": (os.path.basename(file_path), f, "audio/ogg")},
-            data={"model": "whisper-large-v3", "response_format": "text"},
+            data=data,
             timeout=30,
         )
     resp.raise_for_status()
     return resp.text.strip()
 
-def parse_task(text, today, habit_names, owner_names):
+EXPLICIT_CATEGORIES = {
+    "работа": "работа", "работу": "работа", "work": "работа", "job": "работа", "office": "работа",
+    "личное": "личное", "personal": "личное",
+    "дом": "дом", "дома": "дом", "home": "дом", "house": "дом", "chores": "дом",
+}
+
+def explicit_category(text):
+    """Категория, названную отдельным словом в конце фразы («купить хлеб, дом»,
+    «dentist on Monday, work»), модель нередко игнорирует — считает по смыслу.
+    Поэтому разбираем такой хвост кодом. Возвращает (категория, фраза без
+    хвоста) или (None, исходная фраза)."""
+    stripped = (text or "").strip()
+    m = re.search(r"[,;)\-–—]\s*([A-Za-zА-яЁё]+)\s*[.!]?$", stripped)
+    if not m:
+        return None, text
+    category = EXPLICIT_CATEGORIES.get(m.group(1).lower())
+    if not category:
+        return None, text
+    return category, stripped[:m.start()].strip(" ,;-–—")
+
+def parse_task(text, today, habit_names, owner_names, glossary=""):
     """Понять задачу через Groq LLaMA."""
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
     habit_list_str = ", ".join(f'"{name}"' for name in habit_names)
     owners_list_str = ", ".join(f'"{name}"' for name in owner_names) or "нет других участников"
+    glossary_hint = (f"\nЭтот участник часто вставляет английские слова: {glossary}. "
+                     "Расшифровка голоса могла записать их русскими буквами "
+                     "(«прескул» → «preschool», «плейдейт» → «playdate») — верни правильное "
+                     "английское написание в поле task.") if glossary else ""
     prompt = f"""Сегодня {today}. Пользователь сказал: "{text}"
+
+Пользователь может говорить по-русски, по-английски или мешать языки. НЕ переводи
+его слова: в поле task оставляй формулировку и язык как сказано.{glossary_hint}
 
 Ответь ТОЛЬКО валидным JSON объектом, без пояснений, без markdown:
 {{"type":"task","category":"личное","task":"{text}","date":null,"date_uncertain":false,"time":null,"habit_name":null,"habit_value":null,"period":null,"target_user":null,"missing":[]}}
 
 Заполни поля правильно:
 - type: "task" (обычная разовая задача), "habit" (привычка: сон/витамины/прогулка/вода/встала/легла), "note" (заметка), "goal" (цель на месяц или на год, а не разовая задача — например «цель на месяц выучить 50 слов» или «добавь годовую цель — накопить на отпуск»), "delete" (просьба удалить/убрать/стереть/отменить уже существующую запись, например «удали запись про парикмахера»), "peek" (спрашивают о делах/привычках/целях ДРУГОГО участника, а не о своих — например «что у Мамы сегодня?», «какие у неё цели?»), "question" (вопрос, комментарий или рассуждение вслух, НЕ задача для записи)
-- category: "работа", "личное" или "дом". Угадывай по контексту, где он есть (парикмахер/врач/магазин = личное, уборка/готовка = дом, встреча/звонок коллеге = работа). Если контекста вообще нет и категория — чистое гадание (например голое «встреча» без единой зацепки) — всё равно дай наиболее вероятную догадку, но добавь "category" в missing
+- category: "работа", "личное" или "дом" (именно по-русски, даже если сказано по-английски: work/office/meeting = работа, home/house/chores/laundry = дом, personal/kids/school/doctor = личное). Если пользователь сам назвал категорию отдельным словом — бери её и не повторяй это слово в task. Иначе угадывай по контексту (парикмахер/врач/магазин = личное, уборка/готовка = дом, встреча/звонок коллеге = работа). Если контекста вообще нет и категория — чистое гадание (например голое «встреча» без единой зацепки) — всё равно дай наиболее вероятную догадку, но добавь "category" в missing
 - task: краткое описание задачи или цели. Для type="delete" — только ключевые слова для поиска записи, без слов «удали»/«убери»/«сотри»
 - date: если упомянута ЛЮБАЯ дата — "сегодня", "завтра", "послезавтра", конкретное число («15 сентября», «20.09»), день недели («в понедельник», ближайший предстоящий) или «через N дней» — вычисли её от сегодняшней даты ({today}) и верни в формате ДД.ММ.ГГГГ. Если дата вообще не упомянута — null
 - date_uncertain: true, если дату пришлось угадывать не полностью — например, названо только число дня («шестнадцатого», «на 16-е») без месяца, и месяц выбран как ближайший подходящий. false, если дата либо не называлась вовсе (это не date_uncertain, date останется null), либо названа полностью и однозначно
@@ -204,7 +243,15 @@ def parse_task(text, today, habit_names, owner_names):
     end   = raw.rfind("}") + 1
     if start >= 0 and end > start:
         raw = raw[start:end]
-    return json.loads(raw)
+    parsed = json.loads(raw)
+
+    category, _ = explicit_category(text)
+    if category and parsed.get("type") in ("task", "note"):
+        parsed["category"] = category
+        parsed["missing"] = [f for f in (parsed.get("missing") or []) if f != "category"]
+        _, task_without_category = explicit_category(parsed.get("task") or "")
+        parsed["task"] = task_without_category
+    return parsed
 
 def extract_screenshot_data(image_path):
     """Разбирает произвольный скриншот через Groq vision (та же модель,
@@ -401,6 +448,24 @@ def remember_value(owner, habit_name, value):
             return
     if value:
         ws.append_row([owner, habit_name, value])
+
+# Слова, которые участник обычно говорит по-английски посреди русской речи.
+# Лежат в том же листе "🧠 Бот помнит" строкой с этим ключом — список можно
+# дописать прямо в таблице, бот подхватит в течение пяти минут.
+GLOSSARY_KEY = "🗣 Английские слова"
+DEFAULT_GLOSSARY = "preschool, playdate, playground, pick-up, drop-off, homework, grocery, mall"
+_glossary_cache = {"by_owner": {}, "ts": 0}
+
+def get_glossary(owner):
+    now = time.time()
+    if now - _glossary_cache["ts"] > HABIT_CACHE_TTL:
+        try:
+            _glossary_cache["by_owner"] = {o: value for (o, key), value in get_remembered().items()
+                                           if key == GLOSSARY_KEY}
+            _glossary_cache["ts"] = now
+        except Exception:
+            logger.exception("Не удалось прочитать список английских слов")
+    return _glossary_cache["by_owner"].get(owner, DEFAULT_GLOSSARY)
 
 def remember_supplement_set(owner, habit_name, value):
     """Запоминает продиктованный список как набор. Одиночное значение
@@ -1058,7 +1123,16 @@ RU_MONTHS_GEN = {
 RU_WEEKDAYS = [
     ("понедельник", 0), ("вторник", 1), ("сред", 2), ("четверг", 3),
     ("пятниц", 4), ("суббот", 5), ("воскресень", 6),
+    # Юля живёт в Йоханнесбурге и половину слов говорит по-английски
+    ("monday", 0), ("tuesday", 1), ("wednesday", 2), ("thursday", 3),
+    ("friday", 4), ("saturday", 5), ("sunday", 6),
 ]
+EN_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 def parse_flexible_date(text, today_dt):
     """Понимает "сегодня"/"вчера", "13.09"/"13.09.2026", "13 сентября" и
@@ -1066,10 +1140,14 @@ def parse_flexible_date(text, today_dt):
     if not text:
         return None
     t = text.strip().lower()
-    if "сегодня" in t:
+    if "сегодня" in t or "today" in t:
         return today_dt.strftime("%d.%m.%Y")
-    if "вчера" in t:
+    if "вчера" in t or "yesterday" in t:
         return (today_dt - timedelta(days=1)).strftime("%d.%m.%Y")
+    if "послезавтра" in t:
+        return (today_dt + timedelta(days=2)).strftime("%d.%m.%Y")
+    if "завтра" in t or "tomorrow" in t:
+        return (today_dt + timedelta(days=1)).strftime("%d.%m.%Y")
 
     m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", t)
     if m:
@@ -1078,6 +1156,17 @@ def parse_flexible_date(text, today_dt):
             return datetime(year, month, day).strftime("%d.%m.%Y")
         except ValueError:
             return None
+
+    for pattern, month_first in ((r"(\d{1,2})\s+(" + "|".join(EN_MONTHS) + r")\b", False),
+                                 (r"\b(" + "|".join(EN_MONTHS) + r")\s+(\d{1,2})\b", True)):
+        m = re.search(pattern, t)
+        if m:
+            month = EN_MONTHS[m.group(1) if month_first else m.group(2)]
+            day = int(m.group(2) if month_first else m.group(1))
+            try:
+                return datetime(today_dt.year, month, day).strftime("%d.%m.%Y")
+            except ValueError:
+                return None
 
     m = re.search(r"(\d{1,2})\s+(" + "|".join(RU_MONTHS_GEN) + r")", t)
     if m:
@@ -1188,7 +1277,7 @@ async def process_text(update, text, owner):
     user_id = str(update.effective_user.id)
     today   = datetime.now().strftime("%d.%m.%Y")
     try:
-        parsed = parse_task(text, today, get_habit_list(), ALL_OWNERS)
+        parsed = parse_task(text, today, get_habit_list(), ALL_OWNERS, get_glossary(owner))
     except Exception:
         logger.exception("Task parsing failed")
         await update.message.reply_text(
@@ -1344,7 +1433,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
     await update.message.reply_text("🎤 Расшифровываю...")
     try:
-        text = transcribe_voice(tmp_path)
+        text = transcribe_voice(tmp_path, get_glossary(owner))
         os.unlink(tmp_path)
         await update.message.reply_text(f"📝 Услышала: _{text}_", parse_mode="Markdown")
         if await consume_pending_habit_value(update, text, owner):
@@ -2059,7 +2148,7 @@ async def run_nightly_job(context: ContextTypes.DEFAULT_TYPE):
         leftover_texts, leftover_rows = [], []
         for _, row, text in taken:
             try:
-                parsed = parse_task(text, today, habit_names, ALL_OWNERS)
+                parsed = parse_task(text, today, habit_names, ALL_OWNERS, get_glossary(owner))
                 summary_line = _file_parsed_note(owner, parsed, today)
             except Exception:
                 logger.exception(f"Ночной агент: не удалось разложить заметку {owner}: {text!r}")
