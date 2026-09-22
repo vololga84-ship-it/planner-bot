@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Списки витаминов больше не затираются: «добавь ещё магний» дописывает к набору, «убери цинк из витаминов» убирает один пункт, а «вечером пью то-то» заменяет список целиком."
+LATEST_CHANGE_NOTE = "Появилась короткая инструкция: команда /help или кнопка «❓ Как мной пользоваться» в меню. Там же написано то, о чём многие не знают: можно спросить «что у Оли сегодня?» и увидеть расписание другого участника."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -1563,6 +1563,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Привет, {display_name_for(update)}! Я твой личный планнер.\n\n"
         "Говори или пиши — разберу, что это: задача, привычка, цель или заметка. "
         "Для остального — кнопки внизу.\n\n"
+        "❓ Что я умею и как исправлять записи — /help\n"
         "♻️ Если что-то зависнет или пойдёт не так — пришли /start ещё раз, всё сброшу.",
         reply_markup=main_keyboard_for(owner))
 
@@ -1868,6 +1869,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await done_command(update, context)
     elif data == "menu_habits":
         await habits_command(update, context)
+    elif data == "menu_help":
+        await help_command(update, context)
     elif data == "menu_week":
         await week_text_command(update, context)
     elif data == "menu_goals":
@@ -2172,6 +2175,63 @@ def render_week_text(data):
             lines.append(_plain(item.get("text")))
     return chr(10).join(lines).strip()
 
+def _genitive(name):
+    """«Мама» -> «Мамы», «Юля» -> «Юли» — чтобы пример в инструкции читался
+    по-русски. Имена участников задаются в USERS, обычно это женские имена."""
+    if name.endswith("я"):
+        return name[:-1] + "и"
+    if name.endswith("а"):
+        return name[:-1] + ("и" if name[-2:-1] in "гкхжчшщ" else "ы")
+    return name
+
+def help_text_for(owner):
+    """Короткая инструкция под конкретного участника: кнопки у всех разные,
+    и пример про чужое расписание лучше приводить с настоящим именем —
+    участники обычно не догадываются, что так вообще можно."""
+    others = [name for name in ALL_OWNERS if name != owner]
+    peek_example = f"«что у {_genitive(others[0])} сегодня?»" if others else "«что у Мамы сегодня?»"
+    capture = "кнопка «📝 Заметки»"
+    if owner in BLOG_OWNERS:
+        capture = "кнопки «📝 Заметки» и «💡 Идеи для постов»"
+    if owner not in BOT_ADMIN_OWNERS:
+        capture += ", а пожелания к самому боту — «🛠 Идея для бота»"
+    lines = [
+        "*❓ Как мной пользоваться*",
+        "",
+        "*Записать* — просто скажи голосом или напиши:",
+        "• «завтра в 15:00 врач» — задача",
+        "• «встала в 7:30», «выпила 5 стаканов воды» — привычка",
+        "• «цель на месяц — закрыть ИП» — цель",
+        "Категорию можно назвать словом в конце: «купить хлеб, дом».",
+        "",
+        "*Поправить и убрать* — тоже словами:",
+        "• «удали запись про врача» — уберу задачу",
+        "• «добавь в витамины магний» — допишу к списку",
+        "• «убери цинк из витаминов» — уберу один пункт из списка",
+        "• «вечером пью магний и цинк» — заменю список целиком",
+        "Перенести задачу на другой день можно кнопкой под ответом бота или в вечернем чек-листе.",
+        "",
+        "*Отметить сделанное:*",
+        "• кнопка «✅ Отметить выполненное» — список задач на сегодня",
+        "• вечером в 21:05 чек-лист сам спросит про задачи и привычки",
+        "",
+        "*Посмотреть:*",
+        "• «📅 Сегодня» — задачи на сегодня",
+        "• «🗓 Неделя текстом» в меню — вся неделя сообщением, без браузера",
+        "• «📊 Дашборд» — та же неделя страницей",
+        f"• *{peek_example}* — расписание другого участника, спрашивать можно про любого",
+        "",
+        f"*Записать мысль, а не задачу:* {capture}. Вечером я сама разложу записанное и пришлю результат.",
+        "",
+        "Что-то пошло не так — пришли /start, он сбросит все режимы.",
+    ]
+    return chr(10).join(lines)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    await update.effective_message.reply_text(help_text_for(owner_for(update)), parse_mode="Markdown")
+
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     owner = owner_for(update)
@@ -2181,6 +2241,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Привычки", callback_data="menu_habits")],
         [InlineKeyboardButton("🎯 Цели", callback_data="menu_goals")],
         [InlineKeyboardButton("🗓 Неделя текстом", callback_data="menu_week")],
+        [InlineKeyboardButton("❓ Как мной пользоваться", callback_data="menu_help")],
     ]
     dashboard_url = DASHBOARD_URLS.get(owner)
     if dashboard_url:
@@ -3114,6 +3175,7 @@ async def main_async():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("menu",   menu_command))
+    app.add_handler(CommandHandler("help",   help_command))
     app.add_handler(CommandHandler("table",  table_command))
     app.add_handler(CommandHandler("today",  today_tasks))
     app.add_handler(CommandHandler("done",   done_command))
