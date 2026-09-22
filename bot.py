@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Если Google Таблицы отвечают отказом из-за лимита, бот больше не теряет продиктованное: ждёт двадцать секунд и записывает сам. А если запись всё-таки не прошла, он называет причину, а не просто «не удалось»."
+LATEST_CHANGE_NOTE = "Списки витаминов больше не затираются: «добавь ещё магний» дописывает к набору, «убери цинк из витаминов» убирает один пункт, а «вечером пью то-то» заменяет список целиком."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -446,7 +446,43 @@ def is_supplement_habit(habit_name):
     return "витамин" in name or "бад" in name
 
 def split_supplements(value):
-    return [item.strip() for item in (value or "").split(",") if item.strip()]
+    """Список из «магний-2, цинк-1» и из «магний и цинк»: голосом люди
+    перечисляют через «и» и «плюс» не реже, чем через запятую."""
+    parts = re.split(r",|;|\bи\b|\bплюс\b|\+", value or "")
+    return [part.strip(" .") for part in parts if part.strip(" .")]
+
+def _supplement_key(item):
+    """Название без дозы: «магний-2» и «магний 3» — одно и то же."""
+    return re.sub(r"[\s\-–—]*\d+\s*$", "", (item or "").strip().lower())
+
+SUPPLEMENT_ADD_WORDS = ("добав", "ещё", "еще", "плюс", "дополнительно", "начала", "буду пить")
+SUPPLEMENT_REMOVE_WORDS = ("убер", "убра", "удал", "исключ", "больше не", "перестал", "закончил", "отмен")
+
+def apply_supplement_change(existing_value, incoming_value, phrase):
+    """Как менять набор: дописать, убрать или заменить целиком. Раньше любая
+    фраза затирала список, и после «добавь ещё два» от прежних восьми
+    витаминов оставалось два. Возвращает (итоговый список, что сделали)."""
+    existing = split_supplements(existing_value)
+    incoming = split_supplements(incoming_value)
+    text = (phrase or "").lower()
+
+    if any(word in text for word in SUPPLEMENT_REMOVE_WORDS):
+        drop = {_supplement_key(item) for item in incoming}
+        kept = [item for item in existing if _supplement_key(item) not in drop]
+        return ", ".join(kept), "remove"
+
+    if any(word in text for word in SUPPLEMENT_ADD_WORDS) and existing:
+        merged = list(existing)
+        for item in incoming:
+            for i, old_item in enumerate(merged):
+                if _supplement_key(old_item) == _supplement_key(item):
+                    merged[i] = item  # ту же добавку назвали с новой дозой
+                    break
+            else:
+                merged.append(item)
+        return ", ".join(merged), "add"
+
+    return ", ".join(incoming), "replace"
 
 def _get_memory_sheet(create):
     sheet = get_sheet()
@@ -1267,6 +1303,44 @@ async def write_to_sheet(message, func, *args):
         await asyncio.sleep(20)
         return await asyncio.to_thread(func, *args)
 
+async def remove_from_supplement_set(update, owner, date_str, query):
+    """«убери цинк из витаминов» — это не удаление записи целиком, а одного
+    пункта из списка добавок. Убираем его и из запомненного набора, и из
+    записи за день. Возвращает True, если что-то убрали."""
+    words = [w for w in re.split(r"[^0-9a-zA-Zа-яёА-ЯЁ]+", (query or "").lower()) if len(w) > 2]
+    if not words:
+        return False
+    try:
+        remembered = get_remembered()
+    except Exception:
+        logger.exception("Не удалось прочитать наборы перед удалением")
+        return False
+
+    for (set_owner, habit_name), value in remembered.items():
+        if set_owner != owner or not is_supplement_habit(habit_name):
+            continue
+        items = split_supplements(value)
+        hit = [item for item in items if any(word in _supplement_key(item) for word in words)]
+        if not hit:
+            continue
+        kept = [item for item in items if item not in hit]
+        new_value = ", ".join(kept)
+        remember_value(owner, habit_name, new_value)
+        # Если этот пункт записан и за сегодня — убираем и оттуда.
+        try:
+            today_value = dict((row[1], row[2]) for _, row in get_habits_for_day(date_str, owner)).get(habit_name, "")
+            today_items = [item for item in split_supplements(today_value)
+                           if _supplement_key(item) not in {_supplement_key(h) for h in hit}]
+            if today_value and len(today_items) != len(split_supplements(today_value)):
+                await write_to_sheet(update.message, add_task_to_sheet,
+                                     owner, "", habit_name, ", ".join(today_items), date_str, "habit")
+        except Exception:
+            logger.exception("Не удалось поправить запись за день после удаления из набора")
+        await update.message.reply_text(
+            f"🗑 Убрала из «{habit_name}»: {', '.join(hit)}.{chr(10)}Осталось: {new_value or 'пусто'}")
+        return True
+    return False
+
 async def save_task(update_or_query, parsed, default_date, owner):
     date_given = bool(parsed.get("date"))
     date_str   = parsed.get("date") or default_date
@@ -1357,27 +1431,43 @@ async def process_text(update, text, owner):
         return
 
     if parsed.get("type") == "habit":
-        date_str = parsed.get("date") or today
+        date_str    = parsed.get("date") or today
+        habit_name  = parsed.get("habit_name", "")
+        habit_value = parsed.get("habit_value", "")
+        action = "replace"
+        # Для витаминов/БАДов смотрим, о чём просили: «добавь ещё магний»
+        # должно дописаться к списку, а не оставить от него один магний.
+        if is_supplement_habit(habit_name):
+            try:
+                known = get_remembered().get((owner, habit_name), "")
+                habit_value, action = apply_supplement_change(known, habit_value, text)
+            except Exception:
+                logger.exception("Не удалось свести набор витаминов")
         try:
-            add_task_to_sheet(owner, "", parsed.get("habit_name", ""),
-                              parsed.get("habit_value", ""), date_str, "habit")
-        except Exception:
+            await write_to_sheet(update.message, add_task_to_sheet,
+                                 owner, "", habit_name, habit_value, date_str, "habit")
+        except Exception as exc:
             logger.exception("Could not save habit to weekly planner")
-            await update.message.reply_text(
-                "❌ Не смогла сопоставить привычку с планнером. Попробуй назвать её иначе.")
+            await update.message.reply_text(f"❌ Не записала «{habit_name}»: {_short_error(exc)}")
             return
         try:
-            remember_supplement_set(owner, parsed.get("habit_name", ""), parsed.get("habit_value", ""))
+            if is_supplement_habit(habit_name):
+                remember_value(owner, habit_name, habit_value)
+            else:
+                remember_supplement_set(owner, habit_name, habit_value)
         except Exception:
             logger.exception("Could not remember supplement set")
+        prefix = {"add": "✅ Дописала, теперь так", "remove": "🗑 Убрала, осталось"}.get(action, "✅ Привычка")
         await update.message.reply_text(
-            f"✅ Привычка: *{parsed.get('habit_name','')}* — {parsed.get('habit_value','')}",
+            f"{prefix}: *{habit_name}* — {habit_value or 'пусто'}",
             parse_mode="Markdown")
         return
 
     if parsed.get("type") == "delete":
         date_str = parsed.get("date") or today
         query    = parsed.get("task", "")
+        if await remove_from_supplement_set(update, owner, date_str, query):
+            return
         matches  = find_matching_entries(date_str, owner, query)
         fell_back_to_day = False
         if not matches and parsed.get("date"):
