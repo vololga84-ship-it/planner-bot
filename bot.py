@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Ссылку на общую Google Таблицу теперь видит только администратор: в ней листы, привычки и цели всех участников. Остальным остаётся свой дашборд — только их собственные данные."
+LATEST_CHANGE_NOTE = "Дашборд теперь рисуется сразу, даже если шрифты Google не загрузились — раньше из-за них страница могла остаться пустой. И появилась проверка связи: добавь /ping в конец ссылки на дашборд, она отвечает текстом без картинок."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -2527,7 +2527,7 @@ DASHBOARD_PAGE_TEMPLATE = """<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>@@TITLE@@</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
   :root {
     --bg: #EEF0F2; --surface: #FFFFFF; --ink: #1B2430; --ink-muted: #626B79; --ink-faint: #9AA2AE;
@@ -2858,9 +2858,21 @@ async def dashboard_http_handler(request):
         return web.Response(status=503, text="Не удалось собрать данные, попробуй обновить через минуту.")
     return web.Response(text=html, content_type="text/html", charset="utf-8")
 
+async def dashboard_ping_handler(request):
+    """Проверка связи: отдаёт пару строк текста без таблиц и шрифтов.
+    Если она открывается, а сам дашборд — нет, дело в отрисовке страницы;
+    если не открывается и она — до сервера не доходит сеть (VPN, прокси,
+    блокировка домена)."""
+    owner = DASHBOARD_TOKEN_TO_OWNER.get(request.match_info["token"])
+    if not owner:
+        return web.Response(status=404, text="Страница не найдена.")
+    return web.Response(text=f"Связь есть. {owner}, время сервера {now_for(owner):%d.%m %H:%M}.",
+                        content_type="text/plain", charset="utf-8")
+
 async def start_dashboard_server():
     web_app = web.Application()
     web_app.router.add_get("/d/{token}", dashboard_http_handler)
+    web_app.router.add_get("/d/{token}/ping", dashboard_ping_handler)
     runner = web.AppRunner(web_app)
     await runner.setup()
     port = int(os.getenv("PORT", "8080"))
