@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Теперь у каждой своё время: вечерний чек-лист приходит в 21:05 по её местному времени, а не по времени сервера, и «сегодня» тоже считается по её поясу — ночные записи больше не уходят во вчерашний день."
+LATEST_CHANGE_NOTE = "Кнопки внизу (Дашборд, Меню, Сегодня, Заметки) снова работают всегда. Раньше, если бот ждал ответа на вопрос из чек-листа, он принимал нажатие кнопки за ответ и отвечал «не поняла»."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -144,6 +144,17 @@ BLOG_OWNERS = set(o.strip() for o in os.getenv("BLOG_OWNERS", "Оля").split(",
 # Кто администрирует бота — этим кнопка "Идея для бота" не нужна (сами
 # себе предложения не шлют); все остальные владельцы её видят.
 BOT_ADMIN_OWNERS = set(o.strip() for o in os.getenv("BOT_ADMIN_OWNERS", "Оля").split(",") if o.strip())
+
+# Нажатия кнопок нижней клавиатуры и команды всегда должны срабатывать,
+# даже когда бот чего-то ждёт (дату скриншота, дату переноса, значение
+# привычки): иначе человек, не ответивший на вопрос из чек-листа, жмёт
+# «📊 Дашборд» и получает «не поняла ответ» вместо дашборда.
+MENU_BUTTON_WORDS = ("Меню", "Дашборд", "Таблица", "Сегодня", "Идеи для постов",
+                     "Заметки", "Идея для бота", "Выйти")
+
+def is_menu_command(text):
+    text = (text or "").strip()
+    return text.startswith("/") or any(word in text for word in MENU_BUTTON_WORDS)
 
 def main_keyboard_for(owner):
     row2 = ([KeyboardButton("💡 Идеи для постов")] if owner in BLOG_OWNERS else []) + [KeyboardButton("📝 Заметки")]
@@ -1084,6 +1095,11 @@ async def consume_pending_habit_value(update, text, owner):
     entry = pending_habit_value.get(user_id)
     if not entry:
         return False
+    if is_menu_command(text):
+        pending_habit_value.pop(user_id, None)
+        await update.message.reply_text(
+            f"Отложила «{entry['habit_name']}» — вернуться к ней можно кнопкой в вечернем чек-листе.")
+        return False
     if (text or "").strip().lower().strip(".!") in ("отмена", "отменить", "отмени"):
         pending_habit_value.pop(user_id, None)
         await update.message.reply_text("Ок, не записываю.")
@@ -1586,7 +1602,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Ждём уточнение даты для скриншота "Здоровья" — этот ответ не должен
     # попасть ни в режимы заметок, ни в разбор задачи.
-    if user_id in pending_health:
+    if user_id in pending_health and not is_menu_command(text):
         date_str = parse_flexible_date(text, now_for(owner))
         if not date_str:
             await update.message.reply_text(
@@ -1603,7 +1619,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Ждём дату для переноса задачи из вечернего чек-листа.
-    if user_id in pending_postpone:
+    if user_id in pending_postpone and not is_menu_command(text):
         date_str = parse_flexible_date(text, now_for(owner))
         if not date_str:
             await update.message.reply_text(
