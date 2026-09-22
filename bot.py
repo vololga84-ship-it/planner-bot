@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Кнопка «🗓 Неделя текстом» присылает в чат всё, что есть в дашборде: задачи по дням, привычки за сегодня и за неделю, цели и очередь заметок. Браузер не нужен — пригодится, когда дашборд не открывается."
+LATEST_CHANGE_NOTE = "Если Google Таблицы отвечают отказом из-за лимита, бот больше не теряет продиктованное: ждёт двадцать секунд и записывает сам. А если запись всё-таки не прошла, он называет причину, а не просто «не удалось»."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -1115,7 +1115,8 @@ async def consume_pending_habit_value(update, text, owner):
     if is_reading_habit(habit_name):
         value, next_book = apply_reading_answer(value, entry.get("book", ""))
     try:
-        add_task_to_sheet(owner, "", habit_name, value, entry["date_str"], "habit")
+        await write_to_sheet(update.message, add_task_to_sheet,
+                             owner, "", habit_name, value, entry["date_str"], "habit")
         if next_book is not None and next_book != entry.get("book", ""):
             remember_value(owner, habit_name, next_book)
         if is_supplement_habit(habit_name):
@@ -1250,6 +1251,22 @@ def is_allowed(update):
     return str(update.effective_user.id) in ALLOWED_USERS
 
 # ── Save task ──────────────────────────────────────────────────
+async def write_to_sheet(message, func, *args):
+    """Запись в таблицу из обработчика: в отдельном потоке (иначе блокирует
+    весь бот) и с одним повтором, если Google ответил 429 — лимит чтений и
+    записей минутный, и при активной переписке втроём в него реально
+    упереться, а терять из-за этого продиктованную задачу обидно."""
+    try:
+        return await asyncio.to_thread(func, *args)
+    except gspread.exceptions.APIError as exc:
+        if getattr(exc.response, "status_code", None) != 429:
+            raise
+        logger.warning("Google Sheets 429 при записи, жду и повторяю")
+        if message:
+            await message.reply_text("⏳ Таблица сейчас занята, подожди секунд двадцать...")
+        await asyncio.sleep(20)
+        return await asyncio.to_thread(func, *args)
+
 async def save_task(update_or_query, parsed, default_date, owner):
     date_given = bool(parsed.get("date"))
     date_str   = parsed.get("date") or default_date
@@ -1258,11 +1275,12 @@ async def save_task(update_or_query, parsed, default_date, owner):
     time_str   = parsed.get("time") or ""
     cat_emoji  = {"работа": "💼", "личное": "👤", "дом": "🏠"}.get(category, "📌")
     try:
-        row_num = add_task_to_sheet(owner, category, task, time_str, date_str)
-    except Exception:
+        row_num = await write_to_sheet(update_or_query.message, add_task_to_sheet,
+                                       owner, category, task, time_str, date_str)
+    except Exception as exc:
         logger.exception("Could not save task to weekly planner")
         await update_or_query.message.reply_text(
-            "❌ Не удалось записать задачу в недельный планнер. Попробуй ещё раз.")
+            f"❌ Не записала «{task}»: {_short_error(exc)}\nПопробуй ещё раз.")
         return
     if time_str:
         add_calendar_event(owner, date_str, time_str, task, category)
