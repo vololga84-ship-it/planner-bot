@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Появилась кнопка «🗓 Неделя текстом»: та же неделя приходит сообщением в чат, браузер не нужен. Пригодится, когда дашборд не открывается — его адрес у российских операторов работает только через VPN."
+LATEST_CHANGE_NOTE = "Кнопка «🗓 Неделя текстом» присылает в чат всё, что есть в дашборде: задачи по дням, привычки за сегодня и за неделю, цели и очередь заметок. Браузер не нужен — пригодится, когда дашборд не открывается."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -2010,7 +2010,7 @@ def _plain(text):
 
 def render_week_text(data):
     """Та же неделя, что в дашборде, но сообщением: задачи по дням,
-    привычки за сегодня и цели."""
+    привычки за сегодня и за неделю, цели и очередь заметок."""
     monday, sunday = data["week_dates"][0][:5], data["week_dates"][6][:5]
     lines = [f"🗓 *Неделя {monday}–{sunday}*", ""]
     for weekday, date_str in zip(data["weekday_names"], data["week_dates"]):
@@ -2023,19 +2023,45 @@ def render_week_text(data):
             lines.append(f"{task['status']} {_plain(task['text'])}  ·  {task['category']}")
         lines.append("")
 
-    habits_today = {name: values.get(data["today"]) for name, values in (data["habits"] or {}).items()}
-    if habits_today:
+    habits = data["habits"] or {}
+    if habits:
         lines.append("*😴 Привычки сегодня*")
-        for name, value in habits_today.items():
-            lines.append(f"• {_plain(name)} — {_plain(value) or 'не записано'}")
+        for name, values in habits.items():
+            today_value = _plain(values.get(data["today"]))
+            lines.append(f"• {_plain(name)} — {today_value or 'не записано'}")
         lines.append("")
+        # За неделю показываем только то, что хоть раз записано, иначе
+        # получается стена из прочерков.
+        tracked = {name: values for name, values in habits.items() if values}
+        if tracked:
+            lines.append("*😴 Привычки за неделю*")
+            for name, values in tracked.items():
+                by_day = "  ".join(f"{weekday} {_plain(values[date_str])}"
+                                   for weekday, date_str in zip(data["weekday_names"], data["week_dates"])
+                                   if values.get(date_str))
+                lines.append(f"• {_plain(name)}: {by_day}")
+            lines.append("")
 
-    active_goals = [g for g in (data["goals"] or []) if g.get("status") != "✅"]
-    if active_goals:
+    goals = data["goals"] or []
+    active_goals = [g for g in goals if g.get("status") != "✅"]
+    if goals:
         lines.append("*🎯 Цели*")
         for goal in active_goals:
             deadline = f" (до {goal['deadline']})" if goal.get("deadline") else ""
             lines.append(f"☐ {_plain(goal['text'])} — {goal['period']}{deadline}")
+        done = len(goals) - len(active_goals)
+        if done:
+            lines.append(f"_выполнено: {done}_")
+        lines.append("")
+
+    queue = ([dict(item, kind="📝 заметка") for item in (data["notes"] or [])] +
+             [dict(item, kind="💡 идея для поста") for item in (data["ideas"] or [])])
+    if queue:
+        queue.sort(key=lambda item: (item.get("date", ""), item.get("time", "")))
+        lines.append("*📥 В очереди на обработку*")
+        for item in queue:
+            lines.append(f"{item['kind']} · {item.get('date', '')} {item.get('time', '')}")
+            lines.append(_plain(item.get("text")))
     return chr(10).join(lines).strip()
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
