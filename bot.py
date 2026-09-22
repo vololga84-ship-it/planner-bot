@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Дашборд теперь рисуется сразу, даже если шрифты Google не загрузились — раньше из-за них страница могла остаться пустой. И появилась проверка связи: добавь /ping в конец ссылки на дашборд, она отвечает текстом без картинок."
+LATEST_CHANGE_NOTE = "Появилась кнопка «🗓 Неделя текстом»: та же неделя приходит сообщением в чат, браузер не нужен. Пригодится, когда дашборд не открывается — его адрес у российских операторов работает только через VPN."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -1760,6 +1760,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await done_command(update, context)
     elif data == "menu_habits":
         await habits_command(update, context)
+    elif data == "menu_week":
+        await week_text_command(update, context)
     elif data == "menu_goals":
         await goals_command(update, context)
     elif data.startswith("done_"):
@@ -1962,6 +1964,7 @@ async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", url=dashboard_url)])
     # Таблица общая на всех: там листы, привычки и цели каждого. Поэтому
     # ссылку на неё видит только администратор, остальным — свой дашборд.
+    keyboard.append([InlineKeyboardButton("🗓 Неделя текстом (без браузера)", callback_data="menu_week")])
     text = "📊 *Твой планнер:*\n\nДашборд — наглядный снимок недели (только твои задачи)."
     if owner in BOT_ADMIN_OWNERS:
         keyboard.append([InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)])
@@ -1971,6 +1974,70 @@ async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         parse_mode="Markdown")
 
+# Домен дашборда (*.railway.app) у российских операторов не открывается без
+# прокси, а на телефоне прокси есть не всегда — поэтому ту же неделю можно
+# получить сообщением в чате. Данные берём из кэша дашборда, если он свежий:
+# пересборка стоит полтора десятка чтений таблицы.
+WEEK_TEXT_CACHE_TTL = 300
+
+async def week_text_command(update, context):
+    if not is_allowed(update):
+        return
+    owner = owner_for(update)
+    message = update.effective_message
+    cached = DASHBOARD_DATA_CACHE.get(owner)
+    if cached and time.time() - cached[0] < WEEK_TEXT_CACHE_TTL:
+        data = cached[1]
+    else:
+        await message.reply_text("🗓 Собираю неделю...")
+        try:
+            data = await asyncio.to_thread(build_dashboard_data, owner)
+        except Exception as exc:
+            logger.exception("Не удалось собрать неделю текстом")
+            await message.reply_text(f"❌ Не получилось собрать неделю: {_short_error(exc)}")
+            return
+        DASHBOARD_DATA_CACHE[owner] = (time.time(), data)
+    for chunk in split_into_telegram_chunks(render_week_text(data)):
+        await message.reply_text(chunk, parse_mode="Markdown")
+
+def _plain(text):
+    """Убирает символы разметки из пользовательского текста: с ними Telegram
+    не отправит сообщение с parse_mode=Markdown («*», «_», «`», «[»)."""
+    out = str(text or "")
+    for ch in ("*", "_", "`", "["):
+        out = out.replace(ch, "")
+    return out
+
+def render_week_text(data):
+    """Та же неделя, что в дашборде, но сообщением: задачи по дням,
+    привычки за сегодня и цели."""
+    monday, sunday = data["week_dates"][0][:5], data["week_dates"][6][:5]
+    lines = [f"🗓 *Неделя {monday}–{sunday}*", ""]
+    for weekday, date_str in zip(data["weekday_names"], data["week_dates"]):
+        mark = " — сегодня" if date_str == data["today"] else ""
+        tasks = data["week"].get(date_str) or []
+        lines.append(f"*{weekday} {date_str[:5]}{mark}*")
+        if not tasks:
+            lines.append("_пусто_")
+        for task in tasks:
+            lines.append(f"{task['status']} {_plain(task['text'])}  ·  {task['category']}")
+        lines.append("")
+
+    habits_today = {name: values.get(data["today"]) for name, values in (data["habits"] or {}).items()}
+    if habits_today:
+        lines.append("*😴 Привычки сегодня*")
+        for name, value in habits_today.items():
+            lines.append(f"• {_plain(name)} — {_plain(value) or 'не записано'}")
+        lines.append("")
+
+    active_goals = [g for g in (data["goals"] or []) if g.get("status") != "✅"]
+    if active_goals:
+        lines.append("*🎯 Цели*")
+        for goal in active_goals:
+            deadline = f" (до {goal['deadline']})" if goal.get("deadline") else ""
+            lines.append(f"☐ {_plain(goal['text'])} — {goal['period']}{deadline}")
+    return chr(10).join(lines).strip()
+
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     owner = owner_for(update)
@@ -1979,6 +2046,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ Отметить выполненное", callback_data="menu_done")],
         [InlineKeyboardButton("📊 Привычки", callback_data="menu_habits")],
         [InlineKeyboardButton("🎯 Цели", callback_data="menu_goals")],
+        [InlineKeyboardButton("🗓 Неделя текстом", callback_data="menu_week")],
     ]
     dashboard_url = DASHBOARD_URLS.get(owner)
     if dashboard_url:
@@ -2450,6 +2518,7 @@ DEFAULT_DASHBOARD_STYLE = {"accent": "#3B6EA8", "accent_bg": "#E4EBF6", "accent_
 # переменной не нужно: ссылка вида .../d/<token> уже содержит его)
 DASHBOARD_TOKEN_TO_OWNER = {url.rstrip("/").rsplit("/", 1)[-1]: owner for owner, url in DASHBOARD_URLS.items()}
 DASHBOARD_CACHE = {}  # owner -> готовый HTML
+DASHBOARD_DATA_CACHE = {}  # owner -> (когда собрали, данные) для недели текстом
 
 def display_name_for_owner(owner):
     for uid, name in USER_NAMES.items():
@@ -2806,6 +2875,7 @@ async def refresh_dashboard_cache(owner):
     try:
         data = await asyncio.to_thread(build_dashboard_data, owner)
         DASHBOARD_CACHE[owner] = render_dashboard_page(owner, data)
+        DASHBOARD_DATA_CACHE[owner] = (time.time(), data)
         _dashboard_last_refresh[owner] = time.time()
     except Exception:
         logger.exception(f"Не удалось обновить дашборд для {owner}")
