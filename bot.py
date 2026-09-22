@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Кнопки внизу (Дашборд, Меню, Сегодня, Заметки) снова работают всегда. Раньше, если бот ждал ответа на вопрос из чек-листа, он принимал нажатие кнопки за ответ и отвечал «не поняла»."
+LATEST_CHANGE_NOTE = "Ссылку на общую Google Таблицу теперь видит только администратор: в ней листы, привычки и цели всех участников. Остальным остаётся свой дашборд — только их собственные данные."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -1960,11 +1960,15 @@ async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dashboard_url = DASHBOARD_URLS.get(owner)
     if dashboard_url:
         keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", url=dashboard_url)])
-    keyboard.append([InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)])
+    # Таблица общая на всех: там листы, привычки и цели каждого. Поэтому
+    # ссылку на неё видит только администратор, остальным — свой дашборд.
+    text = "📊 *Твой планнер:*\n\nДашборд — наглядный снимок недели (только твои задачи)."
+    if owner in BOT_ADMIN_OWNERS:
+        keyboard.append([InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)])
+        text += " Таблица — все данные как есть."
     await update.message.reply_text(
-        "📊 *Твой планнер:*\n\nДашборд — наглядный снимок недели (только твои задачи). "
-        "Таблица — все данные как есть.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         parse_mode="Markdown")
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1979,7 +1983,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dashboard_url = DASHBOARD_URLS.get(owner)
     if dashboard_url:
         keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", url=dashboard_url)])
-    keyboard.append([InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)])
+    if owner in BOT_ADMIN_OWNERS:
+        keyboard.append([InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)])
     await update.message.reply_text(
         "📋 *Главное меню:*",
         reply_markup=InlineKeyboardMarkup(keyboard),
