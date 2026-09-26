@@ -3,3 +3,6 @@
 __pycache__/
 *.py[cod]
 .autopilot/serve.*
+
+# Локальный дамп данных дашборда — в репозитории ему не место
+dashboard_full.json

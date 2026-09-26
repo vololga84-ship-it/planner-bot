@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Появилась короткая инструкция: команда /help или кнопка «❓ Как мной пользоваться» в меню. Там же написано то, о чём многие не знают: можно спросить «что у Оли сегодня?» и увидеть расписание другого участника."
+LATEST_CHANGE_NOTE = "Теперь можно записывать уже сделанное: скажи «сходила к врачу» или «вчера отправила отчёт» — запись появится сразу с галочкой и на нужный день. Планы по-прежнему пишутся как невыполненные."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -222,6 +222,16 @@ def explicit_category(text):
         return None, text
     return category, stripped[:m.start()].strip(" ,;-–—")
 
+WEEKDAY_WORD_RE = re.compile(r"\b(?:понедельник\w*|вторник\w*|сред(?:а|у|ы|е|ой)|четверг\w*|пятниц(?:а|у|ы|е|ей)|суббот(?:а|у|ы|е|ой)|воскресень\w*|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE)
+PAST_MARKERS = ("вчера", "позавчера", "yesterday", "прошл", "на той неделе")
+
+def _mentions_weekday(text):
+    return bool(WEEKDAY_WORD_RE.search(text or ""))
+
+def _mentions_past(text):
+    lower = (text or "").lower()
+    return any(word in lower for word in PAST_MARKERS)
+
 def parse_task(text, today, habit_names, owner_names, glossary=""):
     """Понять задачу через Groq LLaMA."""
     habit_list_str = ", ".join(f'"{name}"' for name in habit_names)
@@ -236,7 +246,7 @@ def parse_task(text, today, habit_names, owner_names, glossary=""):
 его слова: в поле task оставляй формулировку и язык как сказано.{glossary_hint}
 
 Ответь ТОЛЬКО валидным JSON объектом, без пояснений, без markdown:
-{{"type":"task","category":"личное","task":"{text}","date":null,"date_uncertain":false,"time":null,"habit_name":null,"habit_value":null,"period":null,"target_user":null,"missing":[]}}
+{{"type":"task","category":"личное","task":"{text}","date":null,"date_uncertain":false,"done":false,"time":null,"habit_name":null,"habit_value":null,"period":null,"target_user":null,"missing":[]}}
 
 Заполни поля правильно:
 - type: "task" (обычная разовая задача), "habit" (привычка: сон/витамины/прогулка/вода/встала/легла), "note" (заметка), "goal" (цель на месяц или на год, а не разовая задача — например «цель на месяц выучить 50 слов» или «добавь годовую цель — накопить на отпуск»), "delete" (просьба удалить/убрать/стереть/отменить уже существующую запись, например «удали запись про парикмахера»), "peek" (спрашивают о делах/привычках/целях ДРУГОГО участника, а не о своих — например «что у Мамы сегодня?», «какие у неё цели?»), "question" (вопрос, комментарий или рассуждение вслух, НЕ задача для записи)
@@ -244,6 +254,7 @@ def parse_task(text, today, habit_names, owner_names, glossary=""):
 - task: краткое описание задачи или цели. Для type="delete" — только ключевые слова для поиска записи, без слов «удали»/«убери»/«сотри»
 - date: если упомянута ЛЮБАЯ дата — "сегодня", "завтра", "послезавтра", конкретное число («15 сентября», «20.09»), день недели («в понедельник», ближайший предстоящий) или «через N дней» — вычисли её от сегодняшней даты ({today}) и верни в формате ДД.ММ.ГГГГ. Если дата вообще не упомянута — null
 - date_uncertain: true, если дату пришлось угадывать не полностью — например, названо только число дня («шестнадцатого», «на 16-е») без месяца, и месяц выбран как ближайший подходящий. false, если дата либо не называлась вовсе (это не date_uncertain, date останется null), либо названа полностью и однозначно
+- done: true, если человек рассказывает о УЖЕ сделанном («сходила к врачу», «отправила отчёт», «вчера закрыла задачу»), а не о том, что планирует. false — если это план, напоминание или просьба записать на будущее («надо сходить», «завтра врач»)
 - time: время в формате ЧЧ:ММ если упомянуто, иначе null
 - habit_name: для привычки выбери одно точное название из списка: {habit_list_str}
 - habit_value: значение привычки без пояснений, например "23:30", "✅", "45", "8"
@@ -275,6 +286,34 @@ def parse_task(text, today, habit_names, owner_names, glossary=""):
     if start >= 0 and end > start:
         raw = raw[start:end]
     parsed = json.loads(raw)
+
+    # «Вчера купила продукты» — модель иногда забывает проставить дату,
+    # хотя слово названо. Для вчера и позавчера подставляем сами.
+    if not parsed.get("date"):
+        lower = (text or "").lower()
+        for word, days_back in (("позавчера", 2), ("вчера", 1), ("yesterday", 1)):
+            if word in lower:
+                try:
+                    parsed["date"] = (datetime.strptime(today, "%d.%m.%Y")
+                                      - timedelta(days=days_back)).strftime("%d.%m.%Y")
+                except ValueError:
+                    pass
+                break
+    # День недели без уточнения модель понимает как ближайший будущий. Если
+    # о нём говорят в прошедшем времени («в понедельник сделала») — имелся в
+    # виду прошедший, и наоборот. Двигаем строго на неделю и только когда
+    # день назван словом: явные даты («на 5 октября») не трогаем.
+    if parsed.get("type") in ("task", "note") and parsed.get("date") and _mentions_weekday(text):
+        try:
+            said = datetime.strptime(parsed["date"], "%d.%m.%Y")
+            today_dt = datetime.strptime(today, "%d.%m.%Y")
+            ahead = (said - today_dt).days
+            if parsed.get("done") and 0 < ahead <= 7:
+                parsed["date"] = (said - timedelta(days=7)).strftime("%d.%m.%Y")
+            elif not parsed.get("done") and -7 <= ahead < 0 and not _mentions_past(text):
+                parsed["date"] = (said + timedelta(days=7)).strftime("%d.%m.%Y")
+        except ValueError:
+            pass
 
     category, _ = explicit_category(text)
     if category and parsed.get("type") in ("task", "note"):
@@ -685,7 +724,7 @@ def get_week_sheet(date_str, owner, create=False):
 def day_column(date_str):
     return chr(ord("B") + datetime.strptime(date_str, "%d.%m.%Y").weekday())
 
-def add_task_to_sheet(owner, category, task, time_str, date_str, row_type="task"):
+def add_task_to_sheet(owner, category, task, time_str, date_str, row_type="task", done=False):
     ws = get_week_sheet(date_str, owner, create=True)
     column = day_column(date_str)
     if row_type == "habit":
@@ -700,7 +739,8 @@ def add_task_to_sheet(owner, category, task, time_str, date_str, row_type="task"
     for row_num in range(start_row, end_row + 1):
         offset = row_num - start_row
         if offset >= len(values) or not values[offset] or not values[offset][0]:
-            task_text = f"☐ {task}" + (f" — {time_str}" if time_str else "")
+            mark = "✅" if done else "☐"
+            task_text = f"{mark} {task}" + (f" — {time_str}" if time_str else "")
             ws.update(f"{column}{row_num}", [[task_text]])
             return row_num
     raise ValueError("В этой категории на день уже шесть задач.")
@@ -768,9 +808,10 @@ def move_task_to_date(owner, date_str, row_num, new_date_str):
     value = (ws.acell(f"{column}{row_num}").value or "").strip()
     if not value:
         return None
+    was_done = value.startswith("✅")
     task_text, time_str = split_task_time(value.lstrip("☐✅ ").strip())
     category = category_for_row(row_num)
-    add_task_to_sheet(owner, category, task_text, time_str or "", new_date_str)
+    add_task_to_sheet(owner, category, task_text, time_str or "", new_date_str, "task", was_done)
     delete_entry_from_sheet(date_str, owner, row_num)
     if time_str:
         add_calendar_event(owner, new_date_str, time_str, task_text, category)
@@ -1348,26 +1389,32 @@ async def save_task(update_or_query, parsed, default_date, owner):
     task       = parsed.get("task", "")
     time_str   = parsed.get("time") or ""
     cat_emoji  = {"работа": "💼", "личное": "👤", "дом": "🏠"}.get(category, "📌")
+    done = bool(parsed.get("done"))
     try:
         row_num = await write_to_sheet(update_or_query.message, add_task_to_sheet,
-                                       owner, category, task, time_str, date_str)
+                                       owner, category, task, time_str, date_str, "task", done)
     except Exception as exc:
         logger.exception("Could not save task to weekly planner")
         await update_or_query.message.reply_text(
             f"❌ Не записала «{task}»: {_short_error(exc)}\nПопробуй ещё раз.")
         return
-    if time_str:
+    # Уже сделанное в календарь не ставим — напоминать не о чем.
+    if time_str and not done:
         add_calendar_event(owner, date_str, time_str, task, category)
     time_info = f" в {time_str}" if time_str else ""
-    text = (f"✅ Записала!\n\n{cat_emoji} *{category.capitalize()}*\n"
-            f"📌 {task}{time_info}\n📅 {date_str}")
+    head = "✅ Записала как сделанное!" if done else "✅ Записала!"
+    mark = "✅" if done else "📌"
+    text = (f"{head}\n\n{cat_emoji} *{category.capitalize()}*\n"
+            f"{mark} {task}{time_info}\n📅 {date_str}")
     # Дату либо не называли (записала на сегодня по умолчанию), либо
     # назвали только число без месяца (угадала ближайший месяц) — в
     # обоих случаях есть шанс, что имелось в виду другое: даём лёгкий
     # способ поправить, не заставляя отвечать на вопрос при каждой
     # обычной задаче, где дата и так понятна.
     keyboard = None
-    if not date_given:
+    if done:
+        keyboard = None  # переносить сделанное некуда
+    elif not date_given:
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("📅 Не сегодня, перенести", callback_data=f"evpost_{date_str}_{row_num}")]])
     elif parsed.get("date_uncertain"):
@@ -2387,8 +2434,9 @@ def _file_parsed_note(owner, parsed, today):
         task     = parsed.get("task", "")
         date_str = parsed.get("date") or today
         time_str = parsed.get("time") or ""
-        add_task_to_sheet(owner, category, task, time_str, date_str)
-        if time_str:
+        done = bool(parsed.get("done"))
+        add_task_to_sheet(owner, category, task, time_str, date_str, "task", done)
+        if time_str and not done:
             add_calendar_event(owner, date_str, time_str, task, category)
         when = "" if date_str == today else f" ({date_str})"
         return f"✅ {task}{when}"
