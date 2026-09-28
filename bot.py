@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Косметика: после фото можно уточнить словами без названия — «открыла 3 недели назад», «годен до 16.09.2029». Корейские даты вида 20290916 теперь читаются, а прошедшая дата с фото не записывается сроком молча."
+LATEST_CHANGE_NOTE = "Косметика: срок годности с фото бот теперь читает дважды и записывает, только если оба раза совпало, — иначе спросит. После фото можно уточнить словами без названия: «открыла 3 недели назад», «годен до 16.09.2029»."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -3654,6 +3654,22 @@ def parse_cosmetic(text, today, known_names, current=None):
     result = _groq_json(prompt, 1500, "косметика: фраза")
     return result.get("box") or {}, result.get("items") or []
 
+def reread_expiry(image_path):
+    """Второе, отдельное чтение одного только срока годности: мелкие
+    выдавленные цифры на шве модель читает нестабильно (то 16.09.2029, то
+    16.03.2025), поэтому срок записываем, только если два чтения совпали."""
+    with open(image_path, "rb") as f:
+        b64_image = base64.b64encode(f.read()).decode("utf-8")
+    prompt = ("На фото косметика. Найди на упаковке срок годности: дата с пометкой EXP, 까지 или 사용기한. "
+              "Часто она мелко выдавлена или напечатана на шве тюбика, на дне или на коробке. "
+              "Перепиши цифры ровно как напечатаны, по одной, не угадывая. Корейские даты идут в порядке "
+              "год-месяц-день: 20290916 — это 16.09.2029. Дату изготовления (MFG, 제조) не бери. "
+              'Ответь ТОЛЬКО JSON: {"raw":"цифры как на упаковке","expiry":"ДД.ММ.ГГГГ"}; если срока не видно — null.')
+    content = [{"type": "text", "text": prompt},
+               {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}]
+    result = _groq_json(content, 200, "косметика: срок с фото")
+    return _cos_norm_date(result.get("expiry")) or _cos_norm_date(result.get("raw"))
+
 def extract_cosmetic_photo(image_path):
     with open(image_path, "rb") as f:
         b64_image = base64.b64encode(f.read()).decode("utf-8")
@@ -4164,12 +4180,18 @@ async def handle_parsed_cosmetics(message, user_id, box_info, parsed_list, items
 
 def _cos_photo_notes(f):
     """Что сказать про даты, прочитанные с фото."""
+    if f.get("unsure"):
+        first, second = f["unsure"]
+        return [f"❔ В сроке не уверена: первый раз прочитала {first}, второй — {second} (цифры мелкие). "
+                "Посмотри на упаковку и скажи «годен до …» — запишу."]
     if f.get("doubt"):
         return [f"❔ Вижу дату {f['doubt']} — она уже прошла. Скорее всего это дата изготовления, "
                 "поэтому сроком годности её не записываю. Если это всё-таки срок — скажи «годен до "
                 f"{f['doubt']}»."]
     if _cos_norm_date(f.get("mfg")):
         return [f"❔ Вижу дату изготовления {_cos_norm_date(f['mfg'])}, а срока годности на фото нет."]
+    if f.get("expiry"):
+        return [f"📅 Срок прочитала: {f['expiry']}. Если на упаковке иначе — скажи «годен до …»."]
     if not f.get("expiry"):
         return ["❔ Срока годности на фото не видно. Он часто на шве тюбика, на дне или на обороте коробки — "
                 "пришли фото этого места или скажи «годен до 16.09.2029»."]
@@ -4187,6 +4209,12 @@ async def cosmetics_photo(update, context, owner):
     await message.reply_text("📸 Смотрю, что за средство...")
     try:
         found = await asyncio.to_thread(extract_cosmetic_photo, tmp_path)
+        if len(found) == 1 and _cos_norm_date(found[0].get("expiry")):
+            try:
+                found[0]["expiry_check"] = await asyncio.to_thread(reread_expiry, tmp_path)
+            except Exception:
+                logger.exception("Косметика: не удалось перепроверить срок с фото")
+                found[0]["expiry_check"] = ""
         items = await write_to_sheet(message, load_cosmetics)
     except Exception as e:
         logger.exception("Косметика: не удалось разобрать фото")
@@ -4206,6 +4234,12 @@ async def cosmetics_photo(update, context, owner):
         # молча записать её сроком значит пометить свежее средство просроченным
         expiry = _cos_norm_date(f.get("expiry"))
         f["expiry"] = expiry or None
+        if "expiry_check" in f:
+            check = f.pop("expiry_check")
+            if expiry and check != expiry:
+                # Два чтения разошлись — не записываем ни одно, спрашиваем
+                f["unsure"], f["expiry"] = [expiry, check or "не нашла"], None
+                continue
         if expiry and _cos_date(expiry) < today:
             f["doubt"], f["expiry"] = expiry, None
 
@@ -4254,7 +4288,6 @@ async def cosmetics_photo(update, context, owner):
         cos_set_last(user_id, photo=photo_item)
         details = ", ".join(x for x in (
             f"{photo_item['volume']} {photo_item.get('unit') or ''}".strip() if photo_item.get("volume") else "",
-            f"годен до {_cos_norm_date(photo_item.get('expiry'))}" if _cos_norm_date(photo_item.get("expiry")) else "",
             f"после вскрытия {photo_item['pao_months']} мес" if photo_item.get("pao_months") else "") if x)
         await message.reply_text(
             f"Новое: {photo_item['name']}" + (f" ({details})" if details else "") + ".\n"
