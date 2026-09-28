@@ -963,6 +963,37 @@ def get_bot_ideas_sheet(create=False):
 def add_bot_idea_to_sheet(owner, text):
     _append_log_row(BOT_IDEAS_SHEET, owner, text)
 
+# ── Копилка: ссылки и пересланные посты ────────────────────────────
+# Живёт на том же листе, что и «💡 Идеи для постов» (у кого блога нет —
+# в «📝 Заметки»), чтобы всё интересное лежало в одном месте.
+
+def has_link(msg):
+    entities = msg.entities or msg.caption_entities or ()
+    return any(e.type in ("url", "text_link") for e in entities)
+
+def kopilka_text(msg):
+    """Текст для копилки: сам текст или подпись, скрытые ссылки («слово-
+    ссылка» теряется, если брать только текст) и ссылка на исходный пост,
+    если его переслали из публичного канала."""
+    text = msg.text or msg.caption or ""
+    entities = msg.entities or msg.caption_entities or ()
+    links = [e.url for e in entities if e.type == "text_link" and e.url not in text]
+    # forward_origin — новые версии python-telegram-bot, forward_from_* — старые
+    origin = getattr(msg, "forward_origin", None)
+    chat = getattr(origin, "chat", None) or getattr(msg, "forward_from_chat", None)
+    message_id = getattr(origin, "message_id", None) or getattr(msg, "forward_from_message_id", None)
+    if chat and chat.username and message_id:
+        links.insert(0, f"https://t.me/{chat.username}/{message_id}")
+    elif chat and chat.title:
+        links.insert(0, f"(из «{chat.title}»)")
+    return "\n".join([text] + links).strip()
+
+def add_to_kopilka(owner, text):
+    if owner in BLOG_OWNERS:
+        add_idea_to_sheet(owner, text)
+    else:
+        add_note_to_sheet(owner, text)
+
 def get_new_entries_by_owner(ws):
     """Новые (статус "новая") записи листа-лога (Идеи/Заметки/Идеи для
     бота), по владельцам, отсортированные по дате и времени (старые
@@ -1808,7 +1839,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bot_idea_mode_users.discard(user_id)
             await update.message.reply_text("Вышли из режима записи.", reply_markup=main_keyboard_for(owner))
             return
-        if user_id in post_idea_mode_users:
+        if user_id in post_idea_mode_users and has_link(update.message):
+            # Без эха текста: ссылки с «_» ломают Markdown
+            add_idea_to_sheet(owner, kopilka_text(update.message))
+            await update.message.reply_text("💡 В копилку.")
+        elif user_id in post_idea_mode_users:
             add_idea_to_sheet(owner, text)
             await update.message.reply_text(f"💡 Записала как идею для поста: _{text}_", parse_mode="Markdown")
         elif user_id in general_notes_mode_users:
@@ -1871,7 +1906,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = user_states.pop(user_id)
         await save_task(update, parsed, today, owner)
         return
+    # Ссылка без режима записи — это «посмотреть потом», а не задача
+    if has_link(update.message):
+        add_to_kopilka(owner, kopilka_text(update.message))
+        await update.message.reply_text("💡 В копилку.")
+        return
     await process_text(update, text, owner)
+
+async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пересланный пост (текст, фото с подписью, видео) — сразу в копилку,
+    в каком бы режиме ни был бот."""
+    if not is_allowed(update): return
+    text = kopilka_text(update.message)
+    if not text:
+        await update.message.reply_text("🤔 Тут нет ни текста, ни ссылки — класть в копилку нечего.")
+        return
+    add_to_kopilka(owner_for(update), text)
+    await update.message.reply_text("💡 В копилку.")
 
 async def _remove_checklist_row(query, date_str, row_num):
     """Убирает из клавиатуры (вечернего чек-листа или «Что выполнено?»)
@@ -2269,6 +2320,8 @@ def help_text_for(owner):
         f"• *{peek_example}* — расписание другого участника, спрашивать можно про любого",
         "",
         f"*Записать мысль, а не задачу:* {capture}. Вечером я сама разложу записанное и пришлю результат.",
+        "",
+        "*Копилка:* перешли мне пост или пришли ссылку (из Инстаграма — «Поделиться» → Телеграм → я) — положу в копилку, а не в задачи.",
         "",
         "Что-то пошло не так — пришли /start, он сбросит все режимы.",
     ]
@@ -3229,6 +3282,7 @@ async def main_async():
     app.add_handler(CommandHandler("done",   done_command))
     app.add_handler(CommandHandler("habits", habits_command))
     app.add_handler(CommandHandler("goals",  goals_command))
+    app.add_handler(MessageHandler(filters.FORWARDED & ~filters.VOICE & ~filters.COMMAND, handle_forwarded))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_health_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
