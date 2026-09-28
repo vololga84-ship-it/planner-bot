@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "У Оли появилась кнопка «💄 Косметика»: учёт запаса и открытых средств, сроков годности и после вскрытия, реакций и цен. Остальных участников это не касается — у них всё по-прежнему."
+LATEST_CHANGE_NOTE = "Косметика: после фото можно уточнить словами без названия — «открыла 3 недели назад», «годен до 16.09.2029». Корейские даты вида 20290916 теперь читаются, а прошедшая дата с фото не записывается сроком молча."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -1672,6 +1672,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_cos_pick.pop(user_id, None)
     pending_cos_photo.pop(user_id, None)
     pending_cos_comment.pop(user_id, None)
+    cos_last.pop(user_id, None)
     user_states.pop(user_id, None)
     pending_health.pop(user_id, None)
     pending_postpone.pop(user_id, None)
@@ -3382,6 +3383,18 @@ pending_cos_pick    = {}  # user_id -> {номер вопроса: разобр�
 _cos_pick_counter   = [0]
 pending_cos_photo   = {}  # user_id -> список средств с фото, ждём «в запас»/«открыла»
 pending_cos_comment = {}  # user_id -> (monotonic, строка), ждём комментарий к реакции
+cos_last = {}             # user_id -> {"t", "row", "photo"}: о каком средстве шла речь только что
+COS_LAST_TTL = 900        # секунд: «открыла 3 недели назад» без названия — про него
+
+def cos_set_last(user_id, row=None, photo=None):
+    cos_last[user_id] = {"t": time.monotonic(), "row": row, "photo": photo}
+
+def cos_get_last(user_id):
+    last = cos_last.get(user_id)
+    return last if last and time.monotonic() - last["t"] <= COS_LAST_TTL else None
+
+COS_FOLLOWUP_HINT = ("Уточнить можно словами, без названия: «открыла 3 недели назад», "
+                     "«годен до 03.2028», «после вскрытия 12 месяцев».")
 
 def _cos_num(value):
     s = str(value or "").replace(" ", "").replace(" ", "").replace(",", ".")
@@ -3415,7 +3428,8 @@ def _cos_norm_date(value):
     s = str(value or "").strip()
     if not s:
         return ""
-    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d/%m/%Y", "%d.%m.%y"):
+    s = re.sub(r"[^\d./-]", "", s)  # «20290916까지», «EXP 2029.09.16» — только цифры и разделители
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%d/%m/%Y", "%d.%m.%y", "%Y%m%d"):
         try:
             return datetime.strptime(s, fmt).strftime("%d.%m.%Y")
         except ValueError:
@@ -3610,14 +3624,15 @@ COS_ITEM_FIELDS_PROMPT = f"""- name: название средства: брен
 - format: тип средства одним-двумя словами в единственном числе, по-русски: тонер, эссенция, сыворотка, ампула, крем, гель для умывания, пенка, гидрофильное масло, тканевая маска, пады, патчи, солнцезащитный крем, шампунь...
 - volume: объём, вес или количество штук — числом; null если не указано
 - unit: "мл", "г" или "шт" (тканевые маски, пады, патчи — "шт"); null если не указано
-- expiry: срок годности (годен до / EXP) в формате ДД.ММ.ГГГГ; если есть только месяц и год — "ММ.ГГГГ"; если указана дата производства (MFG) и срок хранения — вычисли; иначе null
+- expiry: срок годности — дата с пометкой EXP / Best before / 사용기한 / 까지 / «годен до», в формате ДД.ММ.ГГГГ; если есть только месяц и год — "ММ.ГГГГ"; если указана дата изготовления и срок хранения — вычисли; иначе null. Дата с пометкой MFG / MFD / 제조 / «изготовлено» — это НЕ срок годности. Корейские даты часто пишут слитно или через точки в порядке год-месяц-день: 20290916 или 2029.09.16 — это 16.09.2029; читай цифры внимательно, по одной. На тюбиках дата часто выдавлена или напечатана на шве (запаянном крае) — посмотри и туда
 - pao_months: срок после вскрытия в месяцах числом (значок открытой баночки 6M → 6, 12M → 12, «год» → 12); null если не указан"""
 
-def parse_cosmetic(text, today, known_names):
+def parse_cosmetic(text, today, known_names, current=None):
     known = "; ".join(known_names[:200]) or "пока пусто"
     prompt = f"""Сегодня {today}. Пользователь ведёт учёт своей косметики и сказал: "{text}"
 
 Уже есть в учёте: {known}
+{f'Только что речь шла о средстве «{current}». Если в фразе нет названия средства — она про него: разбери действие как обычно («открыла 3 недели назад» → open с датой, «годен до 03.2028» → update со сроком), а name оставь null.' if current else ''}
 
 Ответь ТОЛЬКО валидным JSON без пояснений: {{"box":{{"name":null,"paid":null,"show":false}},"items":[{{"action":"add","name":null,"block":null,"format":null,"volume":null,"unit":null,"price":null,"price_is_analog":false,"site_price":null,"box":null,"expiry":null,"pao_months":null,"date":null,"reaction":null,"comment":null}}]}}
 Если в фразе несколько средств — по объекту на каждое. Если фраза только про бокс (сколько он стоил, показать бокс) — items пустой.
@@ -3643,9 +3658,10 @@ def extract_cosmetic_photo(image_path):
     with open(image_path, "rb") as f:
         b64_image = base64.b64encode(f.read()).decode("utf-8")
     prompt = f"""На фото косметика. Найди каждое средство, у которого читается название, и ответь ТОЛЬКО валидным JSON без пояснений:
-{{"items":[{{"name":null,"block":null,"format":null,"volume":null,"unit":null,"expiry":null,"pao_months":null}}]}}
+{{"items":[{{"name":null,"block":null,"format":null,"volume":null,"unit":null,"expiry":null,"mfg":null,"pao_months":null}}]}}
 Заполняй только то, что реально видно на упаковке, не выдумывай. Корейский текст переводи по смыслу.
-{COS_ITEM_FIELDS_PROMPT}"""
+{COS_ITEM_FIELDS_PROMPT}
+- mfg: дата изготовления (MFG / MFD / 제조 / «изготовлено») в формате ДД.ММ.ГГГГ. Если на упаковке одна дата без всякой пометки — верни её сюда, а expiry оставь null: угадывать нельзя"""
     content = [{"type": "text", "text": prompt},
                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}]
     return (_groq_json(content, 1500, "косметика: фото").get("items") or [])
@@ -3691,7 +3707,7 @@ def find_cosmetics(items, name, statuses):
 # В каком порядке искать средство для действия: сначала среди самых
 # вероятных статусов, потом среди остальных.
 COS_SEARCH_ORDER = {
-    "open":     [[COS_STOCK]],
+    "open":     [[COS_STOCK], [COS_OPEN]],
     "finish":   [[COS_OPEN], [COS_STOCK]],
     "discard":  [[COS_OPEN], [COS_STOCK]],
     "gift":     [[COS_STOCK], [COS_OPEN]],
@@ -3743,6 +3759,10 @@ def cos_fill(item, parsed, new):
         item["box"] = parsed["box"].strip()
     if _cos_norm_date(parsed.get("expiry")):
         item["expiry"] = _cos_norm_date(parsed["expiry"])
+    mfg = _cos_norm_date(parsed.get("mfg"))
+    if mfg and mfg not in (item.get("comment") or ""):
+        note = f"изготовлено {mfg}"
+        item["comment"] = f"{item['comment']}\n{note}".strip() if item.get("comment") else note
     if _cos_num(parsed.get("pao_months")):
         item["pao"] = _cos_fmt_num(_cos_num(parsed["pao_months"]))
 
@@ -4031,8 +4051,12 @@ async def cosmetics_text(update, text, owner):
 
     try:
         items = await write_to_sheet(message, load_cosmetics)
+        last = cos_get_last(user_id)
+        last_item = next((it for it in items if last and last.get("row") and it["row"] == last["row"]), None)
+        current = (last["photo"]["name"] if last and last.get("photo") and not last.get("row")
+                   else last_item["name"] if last_item else None)
         box_info, parsed_list = await asyncio.to_thread(parse_cosmetic, text, today.strftime("%d.%m.%Y"),
-                                                        [it["name"] for it in items])
+                                                        [it["name"] for it in items], current)
     except Exception:
         logger.exception("Косметика: не удалось разобрать фразу")
         await message.reply_text("❌ Не получилось разобрать. Попробуй ещё раз чуть позже.")
@@ -4052,6 +4076,14 @@ async def cosmetics_text(update, text, owner):
                                             {"action": "reaction", "comment": comment}, today.strftime("%d.%m.%Y"))
             await message.reply_text("💬 Дописала комментарий.\n" + reply)
             return
+    if current:
+        # Уточнение без названия («открыла 3 недели назад») — про средство,
+        # о котором только что шла речь (фото или предыдущая запись)
+        for p in parsed_list:
+            name = (p.get("name") or "").strip().lower()
+            if (p.get("action") in COS_ACTIONS and (not name or name == current.lower())
+                    and (p["action"] != "add" or not last.get("row"))):
+                p["_last"] = last
     await handle_parsed_cosmetics(message, user_id, box_info, parsed_list, items, today)
 
 async def cos_report_boxes(message, box_names, today_str, paid_for=None, paid=None):
@@ -4078,7 +4110,23 @@ async def handle_parsed_cosmetics(message, user_id, box_info, parsed_list, items
     for parsed in parsed_list:
         action = parsed["action"]
         target = {}
-        if action == "add":
+        last = parsed.pop("_last", None)
+        last_item = next((it for it in items if last and last.get("row") and it["row"] == last["row"]), None)
+        if last and last.get("photo") and not last.get("row"):
+            # Средство с фото ещё не записано — записываем с уточнением
+            photo = last["photo"]
+            merged = {**photo, **{k: v for k, v in parsed.items() if v not in (None, "")}}
+            merged["name"] = photo["name"]
+            if merged["action"] not in ("open", "finish", "discard", "gift", "reaction"):
+                merged["action"] = "add"
+            pending_cos_photo.pop(user_id, None)
+            reply, buttons = await write_to_sheet(message, apply_cosmetic, target, merged, today_str, True)
+            # Остальные уточнения из той же фразы — к уже записанной строке, а не новой
+            last["row"], last["photo"] = target.get("row"), None
+        elif last_item:
+            target = last_item
+            reply, buttons = await write_to_sheet(message, apply_cosmetic, last_item, parsed, today_str)
+        elif action == "add":
             reply, buttons = await write_to_sheet(message, apply_cosmetic, target, parsed, today_str, True,
                                                   len(parsed_list) == 1)
             if not target.get("expiry"):
@@ -4104,6 +4152,8 @@ async def handle_parsed_cosmetics(message, user_id, box_info, parsed_list, items
                 target = item
                 reply, buttons = await write_to_sheet(message, apply_cosmetic, item, parsed, today_str)
         await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+        if target.get("row"):
+            cos_set_last(user_id, row=target["row"])
         if target.get("box") and (parsed.get("site_price") or action == "add"):
             touched_boxes.add(target["box"])
         items = await write_to_sheet(message, load_cosmetics)
@@ -4111,6 +4161,19 @@ async def handle_parsed_cosmetics(message, user_id, box_info, parsed_list, items
         await message.reply_text(f"❔ Без срока годности: {no_expiry}. Пришли фото этикеток или скажи, "
                                  "например: «у тонера Anua годен до 03.2028».")
     await cos_report_boxes(message, touched_boxes, today_str, box_name, box_info.get("paid"))
+
+def _cos_photo_notes(f):
+    """Что сказать про даты, прочитанные с фото."""
+    if f.get("doubt"):
+        return [f"❔ Вижу дату {f['doubt']} — она уже прошла. Скорее всего это дата изготовления, "
+                "поэтому сроком годности её не записываю. Если это всё-таки срок — скажи «годен до "
+                f"{f['doubt']}»."]
+    if _cos_norm_date(f.get("mfg")):
+        return [f"❔ Вижу дату изготовления {_cos_norm_date(f['mfg'])}, а срока годности на фото нет."]
+    if not f.get("expiry"):
+        return ["❔ Срока годности на фото не видно. Он часто на шве тюбика, на дне или на обороте коробки — "
+                "пришли фото этого места или скажи «годен до 16.09.2029»."]
+    return []
 
 @_cos_safe
 async def cosmetics_photo(update, context, owner):
@@ -4138,6 +4201,13 @@ async def cosmetics_photo(update, context, owner):
     if not found:
         await message.reply_text("🤔 Не смогла прочитать название на фото. Сфотографируй этикетку поближе.")
         return
+    for f in found:
+        # Прошедшая дата на упаковке — чаще всего дата изготовления, а не срок:
+        # молча записать её сроком значит пометить свежее средство просроченным
+        expiry = _cos_norm_date(f.get("expiry"))
+        f["expiry"] = expiry or None
+        if expiry and _cos_date(expiry) < today:
+            f["doubt"], f["expiry"] = expiry, None
 
     # Подпись к фото — это действие («открыла», «люблю») или бокс
     # («бокс Olive Young»), а сами средства — с фото
@@ -4169,9 +4239,10 @@ async def cosmetics_photo(update, context, owner):
         known = find_cosmetics(items, photo_item["name"], [COS_STOCK, COS_OPEN, COS_DONE])
         if known:
             it = known[0]
+            cos_set_last(user_id, row=it["row"])
             status = it["status"] + (f", пользоваться до {it['use_until']}" if it.get("use_until") else "")
             await message.reply_text(
-                f"Это {_cos_title(it)} — {status}.\nЧто отметить?",
+                f"Это {_cos_title(it)} — {status}.\nЧто отметить?\n{COS_FOLLOWUP_HINT}",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🧴 Открыла сегодня", callback_data=f"cos_do_open_{it['row']}"),
                      InlineKeyboardButton("✅ Закончилось", callback_data=f"cos_do_finish_{it['row']}")],
@@ -4180,12 +4251,15 @@ async def cosmetics_photo(update, context, owner):
                      InlineKeyboardButton("🗑 Выбросила", callback_data=f"cos_do_discard_{it['row']}")]]))
             return
         pending_cos_photo[user_id] = [photo_item]
+        cos_set_last(user_id, photo=photo_item)
         details = ", ".join(x for x in (
             f"{photo_item['volume']} {photo_item.get('unit') or ''}".strip() if photo_item.get("volume") else "",
             f"годен до {_cos_norm_date(photo_item.get('expiry'))}" if _cos_norm_date(photo_item.get("expiry")) else "",
             f"после вскрытия {photo_item['pao_months']} мес" if photo_item.get("pao_months") else "") if x)
         await message.reply_text(
-            f"Новое: {photo_item['name']}" + (f" ({details})" if details else "") + ". Куда записать?",
+            f"Новое: {photo_item['name']}" + (f" ({details})" if details else "") + ".\n"
+            + "".join(n + "\n" for n in _cos_photo_notes(photo_item))
+            + f"Куда записать?\n{COS_FOLLOWUP_HINT}",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📦 В запас", callback_data="cos_new_add"),
                 InlineKeyboardButton("🧴 Открыла сегодня", callback_data="cos_new_open")]]))
@@ -4222,9 +4296,12 @@ async def cosmetics_callback(query, user_id, owner, data):
         await query.edit_message_reply_markup(None)
         action = "add" if data == "cos_new_add" else "open"
         for p in photo_items:
-            reply, buttons = await write_to_sheet(message, apply_cosmetic, {}, {**p, "action": action}, today_str, True,
+            target = {}
+            reply, buttons = await write_to_sheet(message, apply_cosmetic, target, {**p, "action": action}, today_str, True,
                                                   len(photo_items) == 1)
-            await done(reply, buttons)
+            await done(reply + (f"\n{COS_FOLLOWUP_HINT}" if len(photo_items) == 1 else ""), buttons)
+            if len(photo_items) == 1 and target.get("row"):
+                cos_set_last(user_id, row=target["row"])
         await cos_report_boxes(message, {p.get("box") for p in photo_items}, today_str)
         return
 
@@ -4242,6 +4319,7 @@ async def cosmetics_callback(query, user_id, owner, data):
         await done("🤔 Не нашла это средство в таблице — может, строку удалили. Открой список заново.")
         return
     await query.edit_message_reply_markup(None)
+    cos_set_last(user_id, row=row)
     if kind == "pick":
         parsed = pending_cos_pick.get(user_id, {}).pop(pick_id, None)
         if not parsed:
