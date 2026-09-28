@@ -943,19 +943,21 @@ def _get_or_create_log_sheet(title, create):
 def _append_log_row(title, owner, text):
     ws = _get_or_create_log_sheet(title, create=True)
     now = now_for(owner)
-    ws.append_row([now.strftime("%d.%m.%Y"), now.strftime("%H:%M"), owner, text, "новая"])
+    resp = ws.append_row([now.strftime("%d.%m.%Y"), now.strftime("%H:%M"), owner, text, "новая"])
+    m = re.search(r"![A-Z]+(\d+)", (resp or {}).get("updates", {}).get("updatedRange", ""))
+    return int(m.group(1)) if m else None
 
 def get_ideas_sheet(create=False):
     return _get_or_create_log_sheet(IDEAS_SHEET, create)
 
 def add_idea_to_sheet(owner, text):
-    _append_log_row(IDEAS_SHEET, owner, text)
+    return _append_log_row(IDEAS_SHEET, owner, text)
 
 def get_notes_sheet(create=False):
     return _get_or_create_log_sheet(NOTES_SHEET, create)
 
 def add_note_to_sheet(owner, text):
-    _append_log_row(NOTES_SHEET, owner, text)
+    return _append_log_row(NOTES_SHEET, owner, text)
 
 def get_bot_ideas_sheet(create=False):
     return _get_or_create_log_sheet(BOT_IDEAS_SHEET, create)
@@ -989,10 +991,41 @@ def kopilka_text(msg):
     return "\n".join([text] + links).strip()
 
 def add_to_kopilka(owner, text):
-    if owner in BLOG_OWNERS:
-        add_idea_to_sheet(owner, text)
-    else:
-        add_note_to_sheet(owner, text)
+    """Возвращает (лист, номер строки) — чтобы потом приклеить комментарий."""
+    title = IDEAS_SHEET if owner in BLOG_OWNERS else NOTES_SHEET
+    return title, _append_log_row(title, owner, text)
+
+def append_kopilka_comment(location, comment):
+    title, row = location
+    ws = _get_or_create_log_sheet(title, create=False)
+    if not ws or not row:
+        return
+    current = ws.acell(f"D{row}").value or ""
+    ws.update(f"D{row}", [[f"{current}\n💬 {comment}".strip()]])
+
+# «Поделиться» с комментарием присылает два сообщения почти одновременно:
+# комментарий (без ссылки) и саму ссылку/пост — в любом порядке. Всё, что
+# пришло в пределах этого окна, склеиваем в одну запись копилки.
+KOPILKA_COMMENT_WINDOW = 3  # секунд
+recent_kopilka = {}    # user_id -> (monotonic, (лист, строка))
+pending_comment = {}   # user_id -> {"t", "text", "claimed"}
+
+async def save_kopilka_item(update, text):
+    user_id = str(update.effective_user.id)
+    location = add_to_kopilka(owner_for(update), text)
+    recent_kopilka[user_id] = (time.monotonic(), location)
+    pending = pending_comment.get(user_id)
+    if pending and not pending["claimed"] and time.monotonic() - pending["t"] <= KOPILKA_COMMENT_WINDOW:
+        pending["claimed"] = True
+        append_kopilka_comment(location, pending["text"])
+        await update.message.reply_text("💡 В копилку, с комментарием.")
+        return
+    await update.message.reply_text("💡 В копилку.")
+
+async def _process_text_unless_comment(context):
+    update, text, owner, pending = context.job.data
+    if not pending["claimed"]:
+        await process_text(update, text, owner)
 
 def get_new_entries_by_owner(ws):
     """Новые (статус "новая") записи листа-лога (Идеи/Заметки/Идеи для
@@ -1908,10 +1941,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Ссылка без режима записи — это «посмотреть потом», а не задача
     if has_link(update.message):
-        add_to_kopilka(owner, kopilka_text(update.message))
-        await update.message.reply_text("💡 В копилку.")
+        await save_kopilka_item(update, kopilka_text(update.message))
         return
-    await process_text(update, text, owner)
+    # Комментарий к только что присланной ссылке
+    recent = recent_kopilka.get(user_id)
+    if recent and time.monotonic() - recent[0] <= KOPILKA_COMMENT_WINDOW:
+        append_kopilka_comment(recent[1], text)
+        await update.message.reply_text("💬 Добавила комментарий к ссылке.")
+        return
+    # Комментарий может прийти и раньше ссылки — ждём пару секунд, прежде
+    # чем разбирать текст как задачу
+    pending = {"t": time.monotonic(), "text": text, "claimed": False}
+    pending_comment[user_id] = pending
+    context.job_queue.run_once(_process_text_unless_comment, KOPILKA_COMMENT_WINDOW,
+                               data=(update, text, owner, pending))
 
 async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пересланный пост (текст, фото с подписью, видео) — сразу в копилку,
@@ -1921,8 +1964,7 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("🤔 Тут нет ни текста, ни ссылки — класть в копилку нечего.")
         return
-    add_to_kopilka(owner_for(update), text)
-    await update.message.reply_text("💡 В копилку.")
+    await save_kopilka_item(update, text)
 
 async def _remove_checklist_row(query, date_str, row_num):
     """Убирает из клавиатуры (вечернего чек-листа или «Что выполнено?»)
