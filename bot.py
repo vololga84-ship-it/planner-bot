@@ -4,7 +4,7 @@
 Без библиотеки groq — прямые HTTP запросы
 """
 
-import os, re, time, logging, json, tempfile, base64, asyncio, requests
+import os, re, time, logging, json, tempfile, base64, asyncio, calendar, requests
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Теперь можно записывать уже сделанное: скажи «сходила к врачу» или «вчера отправила отчёт» — запись появится сразу с галочкой и на нужный день. Планы по-прежнему пишутся как невыполненные."
+LATEST_CHANGE_NOTE = "У Оли появилась кнопка «💄 Косметика»: учёт запаса и открытых средств, сроков годности и после вскрытия, реакций и цен. Остальных участников это не касается — у них всё по-прежнему."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -150,7 +150,7 @@ BOT_ADMIN_OWNERS = set(o.strip() for o in os.getenv("BOT_ADMIN_OWNERS", "Оля"
 # привычки): иначе человек, не ответивший на вопрос из чек-листа, жмёт
 # «📊 Дашборд» и получает «не поняла ответ» вместо дашборда.
 MENU_BUTTON_WORDS = ("Меню", "Дашборд", "Таблица", "Сегодня", "Идеи для постов",
-                     "Заметки", "Идея для бота", "Выйти")
+                     "Заметки", "Идея для бота", "Косметика", "Выйти")
 
 def is_menu_command(text):
     text = (text or "").strip()
@@ -160,6 +160,8 @@ def main_keyboard_for(owner):
     row2 = ([KeyboardButton("💡 Идеи для постов")] if owner in BLOG_OWNERS else []) + [KeyboardButton("📝 Заметки")]
     if owner not in BOT_ADMIN_OWNERS:
         row2 = row2 + [KeyboardButton("🛠 Идея для бота")]
+    if owner in COSMETICS_OWNERS:
+        row2 = row2 + [KeyboardButton("💄 Косметика")]
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📋 Меню"), KeyboardButton("📊 Дашборд"), KeyboardButton("📅 Сегодня")], row2],
         resize_keyboard=True,
@@ -1666,6 +1668,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post_idea_mode_users.discard(user_id)
     general_notes_mode_users.discard(user_id)
     bot_idea_mode_users.discard(user_id)
+    cosmetics_mode_users.discard(user_id)
+    pending_cos_pick.pop(user_id, None)
+    pending_cos_photo.pop(user_id, None)
+    pending_cos_comment.pop(user_id, None)
     user_states.pop(user_id, None)
     pending_health.pop(user_id, None)
     pending_postpone.pop(user_id, None)
@@ -1689,10 +1695,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
     await update.message.reply_text("🎤 Расшифровываю...")
     try:
-        text = transcribe_voice(tmp_path, get_glossary(owner))
+        glossary = get_glossary(owner)
+        if user_id in cosmetics_mode_users:
+            glossary = f"{glossary}, {COS_BRANDS_HINT}" if glossary else COS_BRANDS_HINT
+        text = transcribe_voice(tmp_path, glossary)
         os.unlink(tmp_path)
         await update.message.reply_text(f"📝 Услышала: _{text}_", parse_mode="Markdown")
         if await consume_pending_habit_value(update, text, owner):
+            return
+        if user_id in cosmetics_mode_users:
+            await cosmetics_text(update, text, owner)
             return
         if user_id in post_idea_mode_users:
             add_idea_to_sheet(owner, text)
@@ -1759,6 +1771,9 @@ async def handle_health_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_allowed(update): return
     owner   = owner_for(update)
     user_id = str(update.effective_user.id)
+    if user_id in cosmetics_mode_users:
+        await cosmetics_photo(update, context, owner)
+        return
     photo   = update.message.photo[-1]
     file    = await context.bot.get_file(photo.file_id)
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -1862,6 +1877,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await consume_pending_habit_value(update, text, owner):
         return
 
+    if user_id in cosmetics_mode_users:
+        await cosmetics_text(update, text, owner)
+        return
+
     # Уже в одном из режимов записи — выходим только по явной кнопке
     # «Выйти», а любой другой текст сохраняем как есть (даже если он
     # случайно содержит слово "меню" или название другой кнопки).
@@ -1914,6 +1933,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Чтобы выйти, нажми «⬅️ Выйти».",
             reply_markup=CAPTURE_KEYBOARD,
         )
+        return
+
+    if _cos_button(text, "Косметика") and owner in COSMETICS_OWNERS:
+        await enter_cosmetics_mode(update, owner)
         return
 
     # Handle persistent keyboard buttons (match by keyword, since some
@@ -1997,7 +2020,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner   = owner_for(update)
     data    = query.data
     today   = today_for(owner)
-    if data.startswith("cat_"):
+    if data.startswith("cos_"):
+        await cosmetics_callback(query, user_id, owner, data)
+    elif data.startswith("cat_"):
         category = data.replace("cat_", "")
         if user_id in user_states:
             user_states[user_id]["category"] = category
@@ -2363,6 +2388,9 @@ def help_text_for(owner):
         "",
         f"*Записать мысль, а не задачу:* {capture}. Вечером я сама разложу записанное и пришлю результат.",
         "",
+        *(["*💄 Косметика:* нажми кнопку и говори «купила / открыла / закончилась / подарила …» или пришли фото баночки. "
+           "Там же списки запаса и открытого, сроки, сравнение цен и реакции. По понедельникам напомню, что скоро истекает.", ""]
+          if owner in COSMETICS_OWNERS else []),
         "*Копилка:* перешли мне пост или пришли ссылку (из Инстаграма — «Поделиться» → Телеграм → я) — положу в копилку, а не в задачи.",
         "",
         "Что-то пошло не так — пришли /start, он сбросит все режимы.",
@@ -3313,6 +3341,951 @@ async def notify_users_about_restart(app):
         except Exception:
             logger.exception(f"Не удалось уведомить о перезапуске: {telegram_id}")
 
+# ── Косметика ──────────────────────────────────────────────────
+# Учёт косметики: что лежит в запасе и до какого числа годно, что открыто
+# и до какого числа им можно пользоваться (дата вскрытия + срок после
+# вскрытия, но не позже срока с коробки), на сколько хватило, реакция и
+# сравнение цен одного формата в пересчёте на 100 мл/г или на штуку.
+# Отдельный режим с кнопкой, как у заметок: без него «закончилась
+# сыворотка» ушла бы в задачи, а «закончила» — в разбор витаминов.
+COSMETICS_OWNERS = set(o.strip() for o in os.getenv("COSMETICS_OWNERS", "Оля").split(",") if o.strip())
+COSMETICS_SHEET = "💄 Косметика"
+COS_FIELDS = ["block", "name", "format", "volume", "unit", "price", "price_kind", "site_price", "box", "per_unit",
+              "status", "expiry", "opened", "pao", "use_until", "finished", "lasted",
+              "reaction", "comment"]
+COS_HEADER = ["Блок", "Название", "Формат", "Объём", "Ед.", "Цена, ₽", "Цена точная / по аналогу / из бокса", "Цена на сайте, ₩", "Бокс",
+              "₽ за 100 мл/г (или за 1 шт)", "Статус", "Годен до", "Открыто",
+              "Срок после вскрытия, мес", "Использовать до", "Закончилось", "Хватило, дней",
+              "Реакция", "Комментарий"]
+COS_BLOCKS = ["Очищение", "Тонеры и эссенции", "Сыворотки и ампулы", "Кремы", "Вокруг глаз", "SPF",
+              "Маски и пады", "Тело", "Волосы", "Макияж", "Пробники"]
+COS_STOCK, COS_OPEN, COS_DONE, COS_TRASH, COS_GIFT = "в запасе", "открыто", "закончилось", "выбросила", "подарила"
+COS_ACTIONS = ("add", "open", "finish", "discard", "gift", "reaction", "update")
+COS_REACTIONS = {"love": "💚 Люблю", "ok": "👍 Норм", "no": "👎 Не моё", "skin": "⚠️ Реакция кожи"}
+COS_SOON_OPEN_DAYS  = 14  # за сколько дней предупреждать про открытое
+COS_SOON_STOCK_DAYS = 30  # и про запас — его ещё успеть бы открыть
+COS_COMMENT_TTL = 600     # секунд ждём комментарий после кнопки реакции
+COS_BRANDS_HINT = ("Anua, Round Lab, COSRX, Beauty of Joseon, Torriden, Skin1004, Medicube, "
+                   "Numbuzin, Isntree, Dr.Jart, Missha, Some By Mi, Innisfree, Laneige, Mixsoon, "
+                   "Abib, Axis-Y, Purito, Ma:nyo, Haruharu, Goodal, Klairs, Heimish, Etude")
+
+COSMETICS_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("🧴 Открыто"), KeyboardButton("📦 Запас")],
+     [KeyboardButton("⏰ Сроки"), KeyboardButton("⚖️ Сравнить цены")],
+     [KeyboardButton("💬 Реакция"), KeyboardButton("⬅️ Выйти")]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+cosmetics_mode_users = set()
+pending_cos_pick    = {}  # user_id -> {номер вопроса: разобранная фраза}, ждём выбор средства кнопкой
+_cos_pick_counter   = [0]
+pending_cos_photo   = {}  # user_id -> список средств с фото, ждём «в запас»/«открыла»
+pending_cos_comment = {}  # user_id -> (monotonic, строка), ждём комментарий к реакции
+
+def _cos_num(value):
+    s = str(value or "").replace(" ", "").replace(" ", "").replace(",", ".")
+    s = re.sub(r"[^\d.]", "", s)
+    try:
+        return float(s) if s else None
+    except ValueError:
+        return None
+
+def _cos_fmt_num(value):
+    if value is None:
+        return ""
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return f"{value:.1f}".replace(".", ",")
+
+def _cos_date(value):
+    try:
+        return datetime.strptime(str(value or "").strip(), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+def _add_months(d, months):
+    y, m = divmod(d.month - 1 + months, 12)
+    y, m = d.year + y, m + 1
+    return d.replace(year=y, month=m, day=min(d.day, calendar.monthrange(y, m)[1]))
+
+def _cos_norm_date(value):
+    """Дата в ДД.ММ.ГГГГ. «03.2028» (на коробках часто только месяц) —
+    последний день месяца: до его конца средство ещё годно."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%Y.%m.%d", "%d/%m/%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+    m = re.fullmatch(r"(\d{1,2})[./-](\d{4})", s)
+    ym = (int(m.group(2)), int(m.group(1))) if m else None
+    m = re.fullmatch(r"(\d{4})[./-](\d{1,2})", s)
+    ym = ym or ((int(m.group(1)), int(m.group(2))) if m else None)
+    if ym and 1 <= ym[1] <= 12:
+        return f"{calendar.monthrange(*ym)[1]:02d}.{ym[1]:02d}.{ym[0]}"
+    return ""
+
+def cos_recalc(item):
+    """Вычисляемые колонки: цена за 100 мл/г (за штуку), «использовать до»
+    и «хватило, дней»."""
+    price, volume = _cos_num(item.get("price")), _cos_num(item.get("volume"))
+    item["per_unit"] = ""
+    if price and volume:
+        item["per_unit"] = _cos_fmt_num(price / volume if item.get("unit") == "шт" else price / volume * 100)
+    opened, expiry = _cos_date(item.get("opened")), _cos_date(item.get("expiry"))
+    pao = _cos_num(item.get("pao"))
+    until = None
+    if opened:
+        dates = ([_add_months(opened, int(pao))] if pao else []) + ([expiry] if expiry else [])
+        until = min(dates) if dates else None
+    item["use_until"] = until.strftime("%d.%m.%Y") if until else ""
+    finished = _cos_date(item.get("finished"))
+    item["lasted"] = str((finished - opened).days) if opened and finished and item.get("status") == COS_DONE else ""
+    return item
+
+def _cos_row_to_item(row, row_num):
+    item = dict(zip(COS_FIELDS, [c.strip() for c in (row + [""] * len(COS_FIELDS))[:len(COS_FIELDS)]]))
+    item["row"] = row_num
+    return item
+
+def get_cosmetics_sheet():
+    sheet = get_sheet()
+    try:
+        return sheet.worksheet(COSMETICS_SHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=COSMETICS_SHEET, rows=300, cols=len(COS_FIELDS))
+        ws.append_row(COS_HEADER)
+        ws.freeze(rows=1)
+        return ws
+
+def load_cosmetics():
+    rows = get_cosmetics_sheet().get_all_values()
+    return [_cos_row_to_item(r, i) for i, r in enumerate(rows[1:], start=2) if len(r) > 1 and r[1].strip()]
+
+def save_cosmetic(item):
+    cos_recalc(item)
+    ws = get_cosmetics_sheet()
+    values = [str(item.get(f) or "") for f in COS_FIELDS]
+    if item.get("row"):
+        last = gspread.utils.rowcol_to_a1(item["row"], len(COS_FIELDS))
+        ws.update(f"A{item['row']}:{last}", [values])
+    else:
+        resp = ws.append_row(values)
+        m = re.search(r"![A-Z]+(\d+)", (resp or {}).get("updates", {}).get("updatedRange", ""))
+        item["row"] = int(m.group(1)) if m else None
+    return item
+
+def save_cosmetics_batch(items):
+    """Несколько строк одним запросом (пересчёт цен всего бокса)."""
+    if not items:
+        return
+    last_col = gspread.utils.rowcol_to_a1(1, len(COS_FIELDS)).rstrip("1")
+    get_cosmetics_sheet().batch_update([
+        {"range": f"A{it['row']}:{last_col}{it['row']}", "values": [[str(it.get(f) or "") for f in COS_FIELDS]]}
+        for it in items if it.get("row")])
+
+# Боксы: набор покупается за одну сумму, а цены отдельных средств
+# неизвестны. Сумму делим между средствами пропорционально их ценам на
+# корейском сайте бренда — курс валют для этого не нужен, важны только доли.
+COS_BOX_SHEET  = "💄 Боксы"
+COS_BOX_HEADER = ["Бокс", "Дата", "Заплатила, ₽", "Средств", "Комментарий"]
+
+def get_box_sheet():
+    sheet = get_sheet()
+    try:
+        return sheet.worksheet(COS_BOX_SHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=COS_BOX_SHEET, rows=100, cols=len(COS_BOX_HEADER))
+        ws.append_row(COS_BOX_HEADER)
+        ws.freeze(rows=1)
+        return ws
+
+def load_boxes():
+    rows = get_box_sheet().get_all_values()
+    boxes = []
+    for i, r in enumerate(rows[1:], start=2):
+        name, date, paid, count, comment = ([c.strip() for c in r] + [""] * 5)[:5]
+        if name:
+            boxes.append({"row": i, "name": name, "date": date, "paid": paid, "count": count, "comment": comment})
+    return boxes
+
+def find_box(boxes, name):
+    """Бокс по названию: точное совпадение или единственный лучший по словам
+    («бокс Olive Young» найдёт «Olive Young сентябрь»)."""
+    name = (name or "").strip()
+    exact = [b for b in boxes if b["name"].lower() == name.lower()]
+    if exact:
+        return exact[0]
+    query = _cos_words(name) - {"бокс", "бокса", "боксе", "из"}
+    scored = [(sum(1 for q in query if any(_cos_word_match(q, w) for w in _cos_words(b["name"]))), b) for b in boxes]
+    best = max((s for s, _ in scored), default=0)
+    found = [b for s, b in scored if s == best and s > 0]
+    return found[0] if len(found) == 1 else None
+
+def resolve_box_name(name, today_str):
+    box = find_box(load_boxes(), name)
+    if box:
+        return box["name"]
+    save_box({"name": name.strip(), "date": today_str, "paid": "", "count": "0", "comment": ""})
+    return name.strip()
+
+def save_box(box):
+    ws = get_box_sheet()
+    values = [box.get(k, "") for k in ("name", "date", "paid", "count", "comment")]
+    if box.get("row"):
+        ws.update(f"A{box['row']}:E{box['row']}", [values])
+    else:
+        ws.append_row(values)
+
+def recalc_box(box_name, today_str, paid=None):
+    """Раскладывает сумму бокса на средства и возвращает сводку по нему."""
+    box = find_box(load_boxes(), box_name) or {"name": box_name, "date": today_str, "paid": "", "comment": ""}
+    if _cos_num(paid):
+        box["paid"] = _cos_fmt_num(_cos_num(paid))
+    items = [it for it in load_cosmetics() if it.get("box", "").lower() == box["name"].lower()]
+    box["count"] = str(len(items))
+    save_box(box)
+    total_paid = _cos_num(box["paid"])
+    priced = [it for it in items if _cos_num(it.get("site_price"))]
+    total_site = sum(_cos_num(it["site_price"]) for it in priced)
+    if total_paid and total_site:
+        for it in priced:
+            it["price"] = _cos_fmt_num(total_paid * _cos_num(it["site_price"]) / total_site)
+            it["price_kind"] = "из бокса"
+            cos_recalc(it)
+        save_cosmetics_batch(priced)
+    return render_box(box, items)
+
+def render_box(box, items):
+    paid = f": заплатила {box['paid']} ₽" if box.get("paid") else ""
+    lines = [f"📦 Бокс «{box['name']}»{paid}, средств: {len(items)}"]
+    for it in sorted(items, key=lambda i: -(_cos_num(i.get("site_price")) or 0)):
+        site = f"{it['site_price']} ₩" if it.get("site_price") else "₩ ?"
+        rub = f" → {it['price']} ₽" if it.get("price_kind") == "из бокса" and it.get("price") else ""
+        lines.append(f"• {_cos_title(it)} — {site}{rub}")
+    missing = [it for it in items if not _cos_num(it.get("site_price"))]
+    if not box.get("paid"):
+        lines.append(f"\nСколько заплатила за бокс? Скажи: «бокс {box['name']} стоил 7500».")
+    if missing:
+        lines.append(f"\nНет цены на сайте: {len(missing)}. Скажи, например: «{missing[0]['name']} на сайте 18000 вон».")
+        if len(missing) < len(items) and box.get("paid"):
+            lines.append("Пока сумма разложена только на средства с ценой — после остальных пересчитаю.")
+    return "\n".join(lines)
+
+def _groq_json(content, max_tokens, what):
+    """Запрос к Groq с ответом-JSON и одним повтором при 429 (лимит
+    бесплатного тарифа поминутный, Groq сам говорит, сколько ждать)."""
+    for attempt in range(2):
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={**GROQ_HEADERS, "Content-Type": "application/json"},
+            json={
+                "model": "qwen/qwen3.8-27b",
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": max_tokens,
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+                "reasoning_effort": "none",
+                "reasoning_format": "hidden",
+            },
+            timeout=40,
+        )
+        if resp.status_code != 429 or attempt == 1:
+            break
+        m = re.search(r"try again in ([\d.]+)s", resp.text)
+        delay = float(resp.headers.get("retry-after") or (m.group(1) if m else 20))
+        logger.warning(f"Groq 429 ({what}), повтор через {delay:.0f} с")
+        time.sleep(min(max(delay, 1), 40))
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    start, end = raw.find("{"), raw.rfind("}") + 1
+    return json.loads(raw[start:end] if start >= 0 and end > start else raw)
+
+COS_ITEM_FIELDS_PROMPT = f"""- name: название средства: бренд латиницей, как на упаковке, плюс линейка и что это (например "Anua Heartleaf 77 тонер"). Если это явно средство из списка «уже есть в учёте» — верни название ровно как в списке
+- block: один из: {", ".join(COS_BLOCKS)} (тканевые маски, смываемые маски, пады, патчи — "Маски и пады"; мини-версии и пробники — "Пробники"); null если непонятно
+- format: тип средства одним-двумя словами в единственном числе, по-русски: тонер, эссенция, сыворотка, ампула, крем, гель для умывания, пенка, гидрофильное масло, тканевая маска, пады, патчи, солнцезащитный крем, шампунь...
+- volume: объём, вес или количество штук — числом; null если не указано
+- unit: "мл", "г" или "шт" (тканевые маски, пады, патчи — "шт"); null если не указано
+- expiry: срок годности (годен до / EXP) в формате ДД.ММ.ГГГГ; если есть только месяц и год — "ММ.ГГГГ"; если указана дата производства (MFG) и срок хранения — вычисли; иначе null
+- pao_months: срок после вскрытия в месяцах числом (значок открытой баночки 6M → 6, 12M → 12, «год» → 12); null если не указан"""
+
+def parse_cosmetic(text, today, known_names):
+    known = "; ".join(known_names[:200]) or "пока пусто"
+    prompt = f"""Сегодня {today}. Пользователь ведёт учёт своей косметики и сказал: "{text}"
+
+Уже есть в учёте: {known}
+
+Ответь ТОЛЬКО валидным JSON без пояснений: {{"box":{{"name":null,"paid":null,"show":false}},"items":[{{"action":"add","name":null,"block":null,"format":null,"volume":null,"unit":null,"price":null,"price_is_analog":false,"site_price":null,"box":null,"expiry":null,"pao_months":null,"date":null,"reaction":null,"comment":null}}]}}
+Если в фразе несколько средств — по объекту на каждое. Если фраза только про бокс (сколько он стоил, показать бокс) — items пустой.
+
+Бокс — набор, купленный целиком за одну сумму:
+- box.name: название бокса, если фраза про бокс: магазин или бренд латиницей, как пишется в оригинале («бокс олив янг» → "Olive Young", «сентябрьский бокс» → "Сентябрьский"); только если бокс упомянут совсем без названия — "Бокс {today[:5]}"; иначе null
+- box.paid: сколько заплачено за весь бокс в рублях числом; null если не названо
+- box.show: true, если просят показать бокс или его цены
+- items[].box: название бокса, если средство из бокса (то же, что box.name); иначе null
+- items[].site_price: цена средства на корейском сайте бренда в вонах числом («18000 вон», «18 тысяч вон», «₩18000»); null если не названа. Если называют только цену в вонах для уже учтённого средства — action "update"
+
+- action: "add" (купила, есть в запасе, ещё не открыто), "open" (открыла, начала пользоваться), "finish" (закончилось, допользовалась), "discard" (выбросила, испортилось), "gift" (подарила или отдала кому-то), "reaction" (впечатление, отзыв, как подошло, реакция кожи), "update" (поправить или дописать данные уже учтённого средства: цена, срок, объём), "unclear" (непонятно или не про косметику)
+{COS_ITEM_FIELDS_PROMPT}
+- price: цена в рублях числом (не путать с ценой в вонах); null если не названа
+- price_is_analog: true, если цена примерная или взята по аналогу («примерно», «по аналогу», «как у похожего»)
+- date: дата события (открыла / закончилось / выбросила) в формате ДД.ММ.ГГГГ, вычисли от сегодняшней даты («вчера», «в понедельник», «неделю назад»); null если не названа
+- reaction: оценка, если прозвучала: "love" (очень нравится, куплю ещё), "ok" (нормально), "no" (не понравилось, не моё), "skin" (раздражение, высыпания, щиплет, аллергия); null если оценки нет
+- comment: впечатление словами пользователя, без выдумок; для "gift" — кому подарила («маме», «Юле»); null если нет"""
+    result = _groq_json(prompt, 1500, "косметика: фраза")
+    return result.get("box") or {}, result.get("items") or []
+
+def extract_cosmetic_photo(image_path):
+    with open(image_path, "rb") as f:
+        b64_image = base64.b64encode(f.read()).decode("utf-8")
+    prompt = f"""На фото косметика. Найди каждое средство, у которого читается название, и ответь ТОЛЬКО валидным JSON без пояснений:
+{{"items":[{{"name":null,"block":null,"format":null,"volume":null,"unit":null,"expiry":null,"pao_months":null}}]}}
+Заполняй только то, что реально видно на упаковке, не выдумывай. Корейский текст переводи по смыслу.
+{COS_ITEM_FIELDS_PROMPT}"""
+    content = [{"type": "text", "text": prompt},
+               {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}]
+    return (_groq_json(content, 1500, "косметика: фото").get("items") or [])
+
+def _cos_words(text):
+    return {w for w in re.findall(r"[a-zа-я0-9]+", (text or "").lower().replace("ё", "е")) if len(w) > 1}
+
+def _cos_word_match(a, b):
+    """«сыворотку» ~ «сыворотка», «пенку» ~ «пенка», «anua» = «anua»:
+    русские окончания меняются, поэтому достаточно общего начала, которое
+    отличается от слова не больше чем на две последние буквы."""
+    if a == b:
+        return True
+    common = len(os.path.commonprefix([a, b]))
+    return common >= 4 and common >= min(len(a), len(b)) - 2
+
+def _find_scored(items, name, statuses, all_items=None):
+    """(лучший счёт, средства с этим счётом). Если в запросе назван тип
+    средства («пенка», «тонер»), средства другого типа не подходят, даже
+    если совпал бренд: «закончилась пенка Round Lab» — не тонер Round Lab."""
+    query = _cos_words(name)
+    formats = set()
+    for it in all_items or items:
+        formats |= _cos_words(it.get("format"))
+    query_formats = {q for q in query if any(_cos_word_match(q, f) for f in formats)}
+    best, found = 0, []
+    for it in items:
+        if it["status"] not in statuses:
+            continue
+        words = _cos_words(f"{it['name']} {it['format']}")
+        if not all(any(_cos_word_match(q, w) for w in words) for q in query_formats):
+            continue
+        score = sum(1 for q in query if any(_cos_word_match(q, w) for w in words))
+        if score > best:
+            best, found = score, [it]
+        elif score == best and score > 0:
+            found.append(it)
+    return best, found
+
+def find_cosmetics(items, name, statuses):
+    return _find_scored(items, name, statuses)[1]
+
+# В каком порядке искать средство для действия: сначала среди самых
+# вероятных статусов, потом среди остальных.
+COS_SEARCH_ORDER = {
+    "open":     [[COS_STOCK]],
+    "finish":   [[COS_OPEN], [COS_STOCK]],
+    "discard":  [[COS_OPEN], [COS_STOCK]],
+    "gift":     [[COS_STOCK], [COS_OPEN]],
+    "reaction": [[COS_OPEN], [COS_DONE, COS_STOCK, COS_TRASH]],
+    "update":   [[COS_STOCK, COS_OPEN], [COS_DONE, COS_TRASH]],
+}
+
+def pick_cosmetic(items, parsed):
+    """(средство, варианты): одно найденное — первым значением; несколько
+    разных — вторым, чтобы спросить кнопками. Несколько одинаковых
+    баночек — берём ту, что раньше истекает (открывать надо её)."""
+    # Лучшее совпадение по всем статусам; при равном — из более вероятных
+    best, found = 0, []
+    for statuses in COS_SEARCH_ORDER.get(parsed.get("action"), []):
+        score, group = _find_scored(items, parsed.get("name") or "", statuses)
+        if score > best:
+            best, found = score, group
+    if not found:
+        return None, []
+    if len({f["name"].lower() for f in found}) == 1:
+        far = datetime.max.date()
+        key = "opened" if parsed.get("action") != "open" else "expiry"
+        return min(found, key=lambda f: _cos_date(f[key]) or far), []
+    return None, found
+
+def _cos_block(value):
+    value = (value or "").strip().lower()
+    return next((b for b in COS_BLOCKS if b.lower() == value), "")
+
+def cos_fill(item, parsed, new):
+    """Переносит в средство всё, что названо в фразе/на фото."""
+    if new:
+        item["name"] = (parsed.get("name") or "").strip() or "Без названия"
+    block = _cos_block(parsed.get("block"))
+    if block and (new or not item.get("block")):
+        item["block"] = block
+    if parsed.get("format") and (new or not item.get("format")):
+        item["format"] = str(parsed["format"]).strip().lower()
+    if parsed.get("volume") not in (None, ""):
+        item["volume"] = _cos_fmt_num(_cos_num(parsed["volume"]))
+    if parsed.get("unit") in ("мл", "г", "шт"):
+        item["unit"] = parsed["unit"]
+    if parsed.get("price") not in (None, ""):
+        item["price"] = _cos_fmt_num(_cos_num(parsed["price"]))
+        item["price_kind"] = "по аналогу" if parsed.get("price_is_analog") else "точная"
+    if _cos_num(parsed.get("site_price")):
+        item["site_price"] = _cos_fmt_num(_cos_num(parsed["site_price"]))
+    if (parsed.get("box") or "").strip():
+        item["box"] = parsed["box"].strip()
+    if _cos_norm_date(parsed.get("expiry")):
+        item["expiry"] = _cos_norm_date(parsed["expiry"])
+    if _cos_num(parsed.get("pao_months")):
+        item["pao"] = _cos_fmt_num(_cos_num(parsed["pao_months"]))
+
+def _cos_left(date_str, today):
+    d = _cos_date(date_str)
+    if not d:
+        return ""
+    left = (d - today).days
+    if left < 0:
+        return f"⚠️ срок вышел {-left} дн. назад"
+    if left == 0:
+        return "⚠️ последний день"
+    return f"осталось {left} дн."
+
+def _cos_title(it):
+    volume = f" {it['volume']} {it['unit']}".rstrip() if it.get("volume") else ""
+    return f"{it['name']}{volume}"
+
+def apply_cosmetic(item, parsed, today_str, new=False, hint=True):
+    """Применяет действие к средству, сохраняет и возвращает (текст, кнопки)."""
+    action = parsed.get("action")
+    day = _cos_norm_date(parsed.get("date")) or today_str
+    today = _cos_date(today_str)
+    cos_fill(item, parsed, new)
+    buttons = []
+    if action == "add":
+        item["status"] = COS_STOCK
+    elif action == "open":
+        item["status"], item["opened"], item["finished"] = COS_OPEN, day, ""
+    elif action == "finish":
+        item["status"], item["finished"] = COS_DONE, day
+    elif action == "discard":
+        item["status"], item["finished"] = COS_TRASH, day
+    elif action == "gift":
+        item["status"], item["finished"] = COS_GIFT, day
+    if parsed.get("reaction") in COS_REACTIONS:
+        item["reaction"] = COS_REACTIONS[parsed["reaction"]]
+    if parsed.get("comment") and action in ("reaction", "finish", "discard", "gift"):
+        prefix = "🎁 подарила " if action == "gift" else ""
+        note = f"{day[:5]}: {prefix}{parsed['comment'].strip()}"
+        item["comment"] = f"{item['comment']}\n{note}".strip() if item.get("comment") else note
+    save_cosmetic(item)
+    row = item["row"]
+    title = _cos_title(item)
+    if action == "add":
+        lines = [f"📦 В запас: {title}" + (f" — годен до {item['expiry']}" if item.get("expiry") else "")]
+        if not item.get("expiry") and hint:
+            lines.append("Срок годности не назван — скажи, например: «у него годен до 03.2028».")
+    elif action == "open":
+        lines = [f"🧴 Открыла {title} ({day})."]
+        if item.get("use_until"):
+            lines.append(f"Пользоваться до {item['use_until']} — {_cos_left(item['use_until'], today)}")
+        if not item.get("pao"):
+            lines.append("Сколько месяцев годно после вскрытия? (значок открытой баночки, 6M / 12M)")
+            buttons.append([InlineKeyboardButton(f"{m} мес", callback_data=f"cos_pao_{row}_{m}")
+                            for m in (3, 6, 12, 24)])
+    elif action == "finish":
+        lines = [f"✅ Закончилось: {title}."]
+        if item.get("lasted"):
+            lines.append(f"Хватило на {item['lasted']} дн.")
+        if not item.get("reaction"):
+            lines.append("Как оно тебе?")
+            buttons = _cos_reaction_buttons(row)
+    elif action == "discard":
+        lines = [f"🗑 Выбросила: {title}."]
+    elif action == "gift":
+        to = (parsed.get("comment") or "").strip()
+        lines = [f"🎁 Подарила{' ' + to if to else ''}: {title}. Убрала из запаса."]
+    elif action == "reaction":
+        lines = [f"💬 {title}: {item.get('reaction') or 'без оценки'}"]
+        if parsed.get("comment"):
+            lines.append(parsed["comment"].strip())
+        if not parsed.get("reaction"):
+            buttons = _cos_reaction_buttons(row)
+    else:
+        lines = [f"✏️ Обновила: {title}."]
+        details = [f"годен до {item['expiry']}" if item.get("expiry") else "",
+                   f"после вскрытия {item['pao']} мес" if item.get("pao") else "",
+                   f"пользоваться до {item['use_until']}" if item.get("use_until") else "",
+                   f"цена {item['price']} ₽" + (f" ({item['price_kind']})" if item.get("price_kind") in ("по аналогу", "из бокса") else "")
+                   if item.get("price") else "",
+                   f"на сайте {item['site_price']} ₩" if item.get("site_price") else ""]
+        details = [d for d in details if d]
+        if details:
+            lines.append(", ".join(details) + ".")
+    if action == "open" and item.get("format"):
+        same = [it for it in load_cosmetics() if it["status"] == COS_OPEN and it["row"] != row
+                and it.get("format") == item["format"]]
+        if same:
+            lines.append("ℹ️ Такой же формат уже открыт: " + ", ".join(it["name"] for it in same) + ".")
+    return "\n".join(lines), buttons
+
+def _cos_reaction_buttons(row):
+    codes = list(COS_REACTIONS)
+    return [[InlineKeyboardButton(COS_REACTIONS[c], callback_data=f"cos_r_{row}_{c}") for c in codes[:2]],
+            [InlineKeyboardButton(COS_REACTIONS[c], callback_data=f"cos_r_{row}_{c}") for c in codes[2:]]]
+
+def _cos_by_block(items):
+    groups = {}
+    for it in items:
+        groups.setdefault(it.get("block") or "Без блока", []).append(it)
+    order = COS_BLOCKS + ["Без блока"]
+    return sorted(groups.items(), key=lambda g: order.index(g[0]) if g[0] in order else len(order))
+
+def render_cos_open(items, today):
+    opened = [it for it in items if it["status"] == COS_OPEN]
+    if not opened:
+        return "🧴 Открытого сейчас ничего нет."
+    far = datetime.max.date()
+    lines = [f"🧴 Открыто сейчас ({len(opened)}):"]
+    for block, group in _cos_by_block(opened):
+        lines.append(f"\n{block}")
+        for it in sorted(group, key=lambda i: _cos_date(i["use_until"]) or far):
+            mark = (it.get("reaction") or "")[:1]
+            when = (f"до {it['use_until']}, {_cos_left(it['use_until'], today)}" if it.get("use_until")
+                    else "срок после вскрытия не указан")
+            lines.append(f"• {mark + ' ' if mark else ''}{_cos_title(it)} — открыто {it['opened'] or '?'}, {when}")
+    return "\n".join(lines)
+
+def render_cos_stock(items, today):
+    stock = [it for it in items if it["status"] == COS_STOCK]
+    if not stock:
+        return "📦 В запасе пусто."
+    far = datetime.max.date()
+    lines = [f"📦 В запасе ({len(stock)}). Сверху — что истекает раньше, его и открывать первым:"]
+    for block, group in _cos_by_block(stock):
+        lines.append(f"\n{block}")
+        for it in sorted(group, key=lambda i: _cos_date(i["expiry"]) or far):
+            when = (f"годен до {it['expiry']} ({_cos_left(it['expiry'], today)})" if it.get("expiry")
+                    else "❔ срок годности не указан")
+            lines.append(f"• {_cos_title(it)} — {when}")
+    return "\n".join(lines)
+
+def render_cos_deadlines(items, today):
+    """Что пора выбросить или скоро истекает. Пустая строка — всё в порядке."""
+    def soon(it, field, days):
+        d = _cos_date(it.get(field))
+        return d is not None and (d - today).days <= days
+    opened = [it for it in items if it["status"] == COS_OPEN and soon(it, "use_until", COS_SOON_OPEN_DAYS)]
+    stock  = [it for it in items if it["status"] == COS_STOCK and soon(it, "expiry", COS_SOON_STOCK_DAYS)]
+    lines = []
+    if opened:
+        lines.append("🧴 Открытое — срок после вскрытия:")
+        lines += [f"• {_cos_title(it)} — до {it['use_until']}, {_cos_left(it['use_until'], today)}"
+                  for it in sorted(opened, key=lambda i: _cos_date(i["use_until"]))]
+    if stock:
+        lines.append("\n📦 Запас — срок годности:" if lines else "📦 Запас — срок годности:")
+        lines += [f"• {_cos_title(it)} — годен до {it['expiry']}, {_cos_left(it['expiry'], today)}"
+                  for it in sorted(stock, key=lambda i: _cos_date(i["expiry"]))]
+    return "\n".join(lines)
+
+def render_cos_compare(items):
+    """Цены одного формата рядом, в пересчёте на 100 мл/г (или на штуку):
+    так банки разного объёма сравниваются честно."""
+    groups = {}
+    for it in items:
+        if it["status"] == COS_TRASH or not _cos_num(it.get("per_unit")) or not it.get("unit"):
+            continue
+        key = ((it.get("format") or it.get("block") or "без формата").lower(), it["unit"])
+        dedupe = (it["name"].lower(), it.get("price"), it.get("volume"))
+        if dedupe not in {(g["name"].lower(), g.get("price"), g.get("volume")) for g in groups.get(key, [])}:
+            groups.setdefault(key, []).append(it)
+    comparable = {k: v for k, v in groups.items() if len(v) >= 2}
+    if not comparable:
+        return ("⚖️ Сравнивать пока нечего: нужно хотя бы два средства одного формата "
+                "с ценой и объёмом. Скажи, например: «тонер Anua 250 мл стоил 1900».")
+    lines = ["⚖️ Цены одного формата, от выгодного к дорогому (≈ — цена по аналогу, 📦 — доля цены бокса):"]
+    for (fmt, unit), group in sorted(comparable.items()):
+        per = "за 1 шт" if unit == "шт" else f"за 100 {unit}"
+        lines.append(f"\n{fmt.capitalize()} — ₽ {per}")
+        for it in sorted(group, key=lambda i: _cos_num(i["per_unit"])):
+            approx = {"по аналогу": "≈", "из бокса": "📦"}.get(it.get("price_kind"), "")
+            lasted = f", хватило на {it['lasted']} дн." if it.get("lasted") else ""
+            lines.append(f"• {approx}{it['per_unit']} ₽ — {_cos_title(it)}, {approx}{it['price']} ₽{lasted}")
+    singles = sum(1 for v in groups.values() if len(v) == 1)
+    if singles:
+        lines.append(f"\nБез пары для сравнения (нет второго средства того же формата): {singles}.")
+    return "\n".join(lines)
+
+def cos_remember_pick(user_id, parsed):
+    """Запоминает фразу, ждущую выбора средства, и возвращает префикс кнопок:
+    у каждого вопроса свой номер, чтобы два вопроса подряд не путались."""
+    _cos_pick_counter[0] += 1
+    picks = pending_cos_pick.setdefault(user_id, {})
+    picks[_cos_pick_counter[0]] = parsed
+    for old in sorted(picks)[:-10]:  # старые неотвеченные вопросы не копим
+        picks.pop(old)
+    return f"cos_pick{_cos_pick_counter[0]}"
+
+def cos_pick_keyboard(candidates, prefix):
+    rows = []
+    for block, group in _cos_by_block(candidates):
+        for it in group:
+            rows.append([InlineKeyboardButton(f"{_cos_title(it)[:40]} · {block[:12]}",
+                                              callback_data=f"{prefix}_{it['row']}")])
+    return InlineKeyboardMarkup(rows[:30])
+
+async def send_long(message, text, reply_markup=None):
+    chunks = split_into_telegram_chunks(text)
+    for i, chunk in enumerate(chunks):
+        await message.reply_text(chunk, reply_markup=reply_markup if i == len(chunks) - 1 else None)
+
+def _cos_button(text, word):
+    """Нажата кнопка режима (а не фраза, где это слово встретилось)."""
+    return word in text and len(text) <= len(word) + 4
+
+def _cos_safe(handler):
+    """Сбой внутри косметики не должен ронять ни бот, ни обработку
+    остальных сообщений: ловим всё, пишем в лог и коротко отвечаем."""
+    async def wrapper(*args):
+        try:
+            return await handler(*args)
+        except Exception:
+            logger.exception(f"Косметика: сбой в {handler.__name__}")
+            message = getattr(args[0], "message", None)
+            if message:
+                try:
+                    await message.reply_text("❌ В косметике что-то не получилось. Попробуй ещё раз; "
+                                             "остальной планер работает как обычно.")
+                except Exception:
+                    pass
+    wrapper.__name__ = handler.__name__
+    return wrapper
+
+@_cos_safe
+async def enter_cosmetics_mode(update, owner):
+    user_id = str(update.effective_user.id)
+    cosmetics_mode_users.add(user_id)
+    text = ("💄 Режим «Косметика». Говори или пиши:\n"
+            "• «купила крем Round Lab 80 мл за 1500, годен до 03.2028»\n"
+            "• «открыла тонер Anua, 12 месяцев»\n"
+            "• «закончилась сыворотка Numbuzin»\n"
+            "• «тонер Anua — люблю, кожа мягкая» (реакция)\n"
+            "• «цена крема Round Lab примерно 1400 по аналогу»\n"
+            "• «подарила маме маску Abib»\n"
+            "Или пришли фото баночки — узнаю её сама (подпись к фото тоже понимаю: «открыла»).\n"
+            "Кнопки внизу — списки. Чтобы выйти, нажми «⬅️ Выйти».")
+    await update.message.reply_text(text, reply_markup=COSMETICS_KEYBOARD)
+    try:
+        items = await write_to_sheet(None, load_cosmetics)
+    except Exception:
+        logger.exception("Косметика: не удалось прочитать лист")
+        return
+    deadlines = render_cos_deadlines(items, now_for(owner).date())
+    if deadlines:
+        await send_long(update.message, "⏰ Обрати внимание:\n\n" + deadlines)
+
+@_cos_safe
+async def cosmetics_text(update, text, owner):
+    """Сообщение в режиме «Косметика» (текст или расшифрованный голос)."""
+    user_id = str(update.effective_user.id)
+    message = update.message
+    today = now_for(owner).date()
+
+    if "Выйти" in text and len(text) <= 12:
+        cosmetics_mode_users.discard(user_id)
+        pending_cos_comment.pop(user_id, None)
+        await message.reply_text("Вышли из режима «Косметика».", reply_markup=main_keyboard_for(owner))
+        return
+    views = {"Открыто": render_cos_open, "Запас": render_cos_stock}
+    for word, render in views.items():
+        if _cos_button(text, word):
+            items = await write_to_sheet(message, load_cosmetics)
+            await send_long(message, render(items, today))
+            return
+    if _cos_button(text, "Сроки"):
+        items = await write_to_sheet(message, load_cosmetics)
+        await send_long(message, render_cos_deadlines(items, today) or
+                        "⏰ Всё в порядке: ничего не истекает в ближайшие недели.")
+        return
+    if _cos_button(text, "Сравнить цены"):
+        items = await write_to_sheet(message, load_cosmetics)
+        await send_long(message, render_cos_compare(items))
+        return
+    if _cos_button(text, "Реакция"):
+        items = await write_to_sheet(message, load_cosmetics)
+        finished = sorted([it for it in items if it["status"] in (COS_DONE, COS_TRASH)],
+                          key=lambda i: _cos_date(i["finished"]) or datetime.min.date(), reverse=True)[:10]
+        candidates = [it for it in items if it["status"] == COS_OPEN] + finished
+        if not candidates:
+            await message.reply_text("Пока нечего оценивать: нет открытых и законченных средств.")
+            return
+        await message.reply_text("О каком средстве? (сначала открытые, потом недавно закончившиеся)",
+                                 reply_markup=cos_pick_keyboard(candidates, "cos_rx"))
+        return
+
+    try:
+        items = await write_to_sheet(message, load_cosmetics)
+        box_info, parsed_list = await asyncio.to_thread(parse_cosmetic, text, today.strftime("%d.%m.%Y"),
+                                                        [it["name"] for it in items])
+    except Exception:
+        logger.exception("Косметика: не удалось разобрать фразу")
+        await message.reply_text("❌ Не получилось разобрать. Попробуй ещё раз чуть позже.")
+        return
+
+    # Комментарий после кнопки реакции — только если фраза не про другое
+    # действие или другое средство («закончилась пенка» — не комментарий)
+    waiting = pending_cos_comment.pop(user_id, None)
+    item = next((it for it in items if waiting and it["row"] == waiting[1]), None)
+    if item and time.monotonic() - waiting[0] <= COS_COMMENT_TTL and not box_info.get("name"):
+        other = [p for p in parsed_list
+                 if p.get("action") not in ("unclear", "reaction")
+                 or (p.get("name") and not _find_scored([item], p["name"], [item["status"]], items)[1])]
+        if not other:
+            comment = next((p.get("comment") for p in parsed_list if p.get("comment")), None) or text
+            reply, _ = await write_to_sheet(message, apply_cosmetic, item,
+                                            {"action": "reaction", "comment": comment}, today.strftime("%d.%m.%Y"))
+            await message.reply_text("💬 Дописала комментарий.\n" + reply)
+            return
+    await handle_parsed_cosmetics(message, user_id, box_info, parsed_list, items, today)
+
+async def cos_report_boxes(message, box_names, today_str, paid_for=None, paid=None):
+    """Пересчитать цены затронутых боксов и показать сводку."""
+    for name in sorted(n for n in box_names if n):
+        summary = await write_to_sheet(message, recalc_box, name, today_str,
+                                       paid if name == paid_for else None)
+        await send_long(message, summary)
+
+async def handle_parsed_cosmetics(message, user_id, box_info, parsed_list, items, today):
+    today_str = today.strftime("%d.%m.%Y")
+    parsed_list = [p for p in parsed_list if p.get("action") in COS_ACTIONS]
+    box_hint = (box_info.get("name") or next((p.get("box") for p in parsed_list if p.get("box")), "") or "").strip()
+    box_name = await write_to_sheet(message, resolve_box_name, box_hint, today_str) if box_hint else ""
+    for p in parsed_list:
+        if p.get("box") or (box_name and p["action"] == "add"):
+            p["box"] = box_name
+    if not parsed_list and not box_name:
+        await message.reply_text("🤔 Не поняла, что сделать. Скажи, например: «открыла тонер Anua» "
+                                 "или «закончился крем Round Lab».")
+        return
+    touched_boxes = {box_name}
+    no_expiry = 0
+    for parsed in parsed_list:
+        action = parsed["action"]
+        target = {}
+        if action == "add":
+            reply, buttons = await write_to_sheet(message, apply_cosmetic, target, parsed, today_str, True,
+                                                  len(parsed_list) == 1)
+            if not target.get("expiry"):
+                no_expiry += 1
+        else:
+            item, options = pick_cosmetic(items, parsed)
+            if options:
+                await message.reply_text(f"Какое именно — «{parsed.get('name') or '?'}»?",
+                                         reply_markup=cos_pick_keyboard(options, cos_remember_pick(user_id, parsed)))
+                continue
+            if not item and action == "open":
+                # Открыла то, чего не было в запасе, — заводим сразу открытым
+                reply, buttons = await write_to_sheet(message, apply_cosmetic, target, parsed, today_str, True)
+            elif not item:
+                pool = [it for it in items if it["status"] in (COS_OPEN, COS_STOCK)]
+                if pool and action in ("finish", "discard", "gift", "reaction", "update"):
+                    await message.reply_text(f"Не нашла «{parsed.get('name') or '?'}». Выбери из списка:",
+                                             reply_markup=cos_pick_keyboard(pool, cos_remember_pick(user_id, parsed)))
+                else:
+                    await message.reply_text(f"Не нашла «{parsed.get('name') or '?'}» в учёте.")
+                continue
+            else:
+                target = item
+                reply, buttons = await write_to_sheet(message, apply_cosmetic, item, parsed, today_str)
+        await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+        if target.get("box") and (parsed.get("site_price") or action == "add"):
+            touched_boxes.add(target["box"])
+        items = await write_to_sheet(message, load_cosmetics)
+    if len(parsed_list) > 1 and no_expiry:
+        await message.reply_text(f"❔ Без срока годности: {no_expiry}. Пришли фото этикеток или скажи, "
+                                 "например: «у тонера Anua годен до 03.2028».")
+    await cos_report_boxes(message, touched_boxes, today_str, box_name, box_info.get("paid"))
+
+@_cos_safe
+async def cosmetics_photo(update, context, owner):
+    user_id = str(update.effective_user.id)
+    message = update.message
+    today = now_for(owner).date()
+    file = await context.bot.get_file(message.photo[-1].file_id)
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        tmp_path = tmp.name
+    await message.reply_text("📸 Смотрю, что за средство...")
+    try:
+        found = await asyncio.to_thread(extract_cosmetic_photo, tmp_path)
+        items = await write_to_sheet(message, load_cosmetics)
+    except Exception as e:
+        logger.exception("Косметика: не удалось разобрать фото")
+        if getattr(getattr(e, "response", None), "status_code", None) == 429:
+            await message.reply_text("⏳ Распознавалка упёрлась в лимит запросов в минуту. Пришли фото ещё раз через минуту.")
+        else:
+            await message.reply_text("❌ Не получилось разобрать фото. Попробуй ещё раз.")
+        return
+    finally:
+        os.unlink(tmp_path)
+    found = [f for f in found if (f.get("name") or "").strip()]
+    if not found:
+        await message.reply_text("🤔 Не смогла прочитать название на фото. Сфотографируй этикетку поближе.")
+        return
+
+    # Подпись к фото — это действие («открыла», «люблю») или бокс
+    # («бокс Olive Young»), а сами средства — с фото
+    caption = (message.caption or "").strip()
+    box_info, caption_items = {}, []
+    if caption:
+        try:
+            box_info, caption_items = await asyncio.to_thread(
+                parse_cosmetic, caption, today.strftime("%d.%m.%Y"), [it["name"] for it in items])
+        except Exception:
+            logger.exception("Косметика: не удалось разобрать подпись к фото")
+    caption_items = [p for p in caption_items if p.get("action") in COS_ACTIONS]
+    if len(found) == 1 and (caption_items or box_info.get("name")):
+        photo_item = found[0]
+        action = (caption_items[0] if caption_items else {"action": "add"})
+        merged = {**photo_item, **{k: v for k, v in action.items() if v not in (None, "")}}
+        merged["name"] = photo_item["name"]
+        await handle_parsed_cosmetics(message, user_id, box_info, [merged], items, today)
+        return
+    if box_info.get("name"):
+        box_name = await write_to_sheet(message, resolve_box_name, box_info["name"], today.strftime("%d.%m.%Y"))
+        for f in found:
+            f["box"] = box_name
+        if box_info.get("paid"):
+            await write_to_sheet(message, recalc_box, box_name, today.strftime("%d.%m.%Y"), box_info["paid"])
+
+    if len(found) == 1:
+        photo_item = found[0]
+        known = find_cosmetics(items, photo_item["name"], [COS_STOCK, COS_OPEN, COS_DONE])
+        if known:
+            it = known[0]
+            status = it["status"] + (f", пользоваться до {it['use_until']}" if it.get("use_until") else "")
+            await message.reply_text(
+                f"Это {_cos_title(it)} — {status}.\nЧто отметить?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🧴 Открыла сегодня", callback_data=f"cos_do_open_{it['row']}"),
+                     InlineKeyboardButton("✅ Закончилось", callback_data=f"cos_do_finish_{it['row']}")],
+                    [InlineKeyboardButton("💬 Реакция", callback_data=f"cos_rx_{it['row']}"),
+                     InlineKeyboardButton("🎁 Подарила", callback_data=f"cos_do_gift_{it['row']}"),
+                     InlineKeyboardButton("🗑 Выбросила", callback_data=f"cos_do_discard_{it['row']}")]]))
+            return
+        pending_cos_photo[user_id] = [photo_item]
+        details = ", ".join(x for x in (
+            f"{photo_item['volume']} {photo_item.get('unit') or ''}".strip() if photo_item.get("volume") else "",
+            f"годен до {_cos_norm_date(photo_item.get('expiry'))}" if _cos_norm_date(photo_item.get("expiry")) else "",
+            f"после вскрытия {photo_item['pao_months']} мес" if photo_item.get("pao_months") else "") if x)
+        await message.reply_text(
+            f"Новое: {photo_item['name']}" + (f" ({details})" if details else "") + ". Куда записать?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📦 В запас", callback_data="cos_new_add"),
+                InlineKeyboardButton("🧴 Открыла сегодня", callback_data="cos_new_open")]]))
+        return
+
+    new = [f for f in found if not find_cosmetics(items, f["name"], [COS_STOCK, COS_OPEN])]
+    lines = [f"На фото {len(found)} средств:"]
+    lines += [f"• {f['name']}" + ("" if f in new else " — уже есть в учёте") for f in found]
+    if not new:
+        await message.reply_text("\n".join(lines))
+        return
+    pending_cos_photo[user_id] = new
+    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"📦 Добавить новые в запас ({len(new)})" + (f", бокс «{new[0]['box']}»" if new[0].get("box") else ""),
+                             callback_data="cos_new_add")]]))
+
+@_cos_safe
+async def cosmetics_callback(query, user_id, owner, data):
+    if owner not in COSMETICS_OWNERS:
+        return
+    message = query.message
+    today_str = today_for(owner)
+    items = await write_to_sheet(message, load_cosmetics)
+    by_row = {it["row"]: it for it in items}
+
+    async def done(reply, buttons=None):
+        await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+    if data in ("cos_new_add", "cos_new_open"):
+        photo_items = pending_cos_photo.pop(user_id, None)
+        if not photo_items:
+            await query.edit_message_reply_markup(None)
+            return
+        await query.edit_message_reply_markup(None)
+        action = "add" if data == "cos_new_add" else "open"
+        for p in photo_items:
+            reply, buttons = await write_to_sheet(message, apply_cosmetic, {}, {**p, "action": action}, today_str, True,
+                                                  len(photo_items) == 1)
+            await done(reply, buttons)
+        await cos_report_boxes(message, {p.get("box") for p in photo_items}, today_str)
+        return
+
+    m = re.fullmatch(r"cos_pick(\d+)_(\d+)", data)
+    pick_id = int(m.group(1)) if m else None
+    if m:
+        data = f"cos_pick_{m.group(2)}"
+    m = re.fullmatch(r"cos_(pick|rx|do_open|do_finish|do_discard|do_gift)_(\d+)", data) or \
+        re.fullmatch(r"cos_(r)_(\d+)_(\w+)", data) or re.fullmatch(r"cos_(pao)_(\d+)_(\d+)", data)
+    if not m:
+        return
+    kind, row = m.group(1), int(m.group(2))
+    item = by_row.get(row)
+    if not item:
+        await done("🤔 Не нашла это средство в таблице — может, строку удалили. Открой список заново.")
+        return
+    await query.edit_message_reply_markup(None)
+    if kind == "pick":
+        parsed = pending_cos_pick.get(user_id, {}).pop(pick_id, None)
+        if not parsed:
+            await done("Этот вопрос уже устарел — скажи фразу ещё раз.")
+            return
+        await done(*await write_to_sheet(message, apply_cosmetic, item, parsed, today_str))
+        if item.get("box") and parsed.get("site_price"):
+            await cos_report_boxes(message, {item["box"]}, today_str)
+    elif kind == "rx":
+        await done(f"Как тебе {_cos_title(item)}?", _cos_reaction_buttons(row))
+    elif kind.startswith("do_"):
+        await done(*await write_to_sheet(message, apply_cosmetic, item, {"action": kind[3:]}, today_str))
+    elif kind == "r":
+        code = m.group(3)
+        if code not in COS_REACTIONS:
+            return
+        await write_to_sheet(message, apply_cosmetic, item, {"action": "reaction", "reaction": code}, today_str)
+        pending_cos_comment[user_id] = (time.monotonic(), row)
+        await done(f"{COS_REACTIONS[code]} — записала для {_cos_title(item)}.\n"
+                   "Хочешь — надиктуй или напиши комментарий следующим сообщением, я допишу.")
+    elif kind == "pao":
+        reply, buttons = await write_to_sheet(message, apply_cosmetic, item,
+                                              {"action": "update", "pao_months": int(m.group(3))}, today_str)
+        await done(reply, buttons)
+
+async def run_cosmetics_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в неделю, в понедельник утром: что пора выбросить или скоро истекает."""
+    owner = context.job.data
+    if now_for(owner).weekday() != 0:
+        return
+    chat_id = next((tid for tid, name in USER_NAMES.items() if name == owner), None)
+    if not chat_id:
+        return
+    try:
+        items = await asyncio.to_thread(load_cosmetics)
+    except Exception:
+        logger.exception("Косметика: напоминание — не удалось прочитать лист")
+        return
+    text = render_cos_deadlines(items, now_for(owner).date())
+    if not text:
+        return
+    for chunk in split_into_telegram_chunks("💄 Косметика — сроки на эту неделю:\n\n" + text):
+        await context.bot.send_message(chat_id=int(chat_id), text=chunk)
+
 # ── Main ───────────────────────────────────────────────────────
 async def main_async():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -3344,6 +4317,9 @@ async def main_async():
         app.job_queue.run_daily(run_evening_checklist, time=dt_time(hour=21, minute=5, tzinfo=owner_tz),
                                 data=owner, name=f"checklist-{owner}")
         logger.info(f"⏰ {owner}: вечерние задания в 21:00/21:05 по {TIMEZONES.get(owner, DEFAULT_TIMEZONE)}")
+    for owner in COSMETICS_OWNERS & set(ALL_OWNERS):
+        app.job_queue.run_daily(run_cosmetics_reminder, time=dt_time(hour=10, minute=0, tzinfo=tz_for(owner)),
+                                data=owner, name=f"cosmetics-{owner}")
     app.job_queue.run_daily(run_bot_ideas_digest, time=dt_time(hour=21, minute=2, tzinfo=ZoneInfo(DEFAULT_TIMEZONE)))
     app.job_queue.run_repeating(check_reminders, interval=REMINDER_CHECK_INTERVAL, first=10)
     if DASHBOARD_URLS:
