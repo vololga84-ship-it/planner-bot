@@ -4,7 +4,7 @@
 Без библиотеки groq — прямые HTTP запросы
 """
 
-import os, re, time, logging, json, tempfile, base64, asyncio, calendar, requests
+import os, re, time, logging, json, tempfile, base64, asyncio, calendar, requests, zlib
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Косметика: срок годности с фото бот теперь читает дважды и записывает, только если оба раза совпало, — иначе спросит. После фото можно уточнить словами без названия: «открыла 3 недели назад», «годен до 16.09.2029»."
+LATEST_CHANGE_NOTE = "Для блога: новая кнопка «✍️ Готовые посты» — присылает готовые тексты отдельными сообщениями (долгое нажатие → копировать), под каждым кнопки «✅ Опубликован» и «⏸ Отложить»."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -150,7 +150,7 @@ BOT_ADMIN_OWNERS = set(o.strip() for o in os.getenv("BOT_ADMIN_OWNERS", "Оля"
 # привычки): иначе человек, не ответивший на вопрос из чек-листа, жмёт
 # «📊 Дашборд» и получает «не поняла ответ» вместо дашборда.
 MENU_BUTTON_WORDS = ("Меню", "Дашборд", "Таблица", "Сегодня", "Идеи для постов",
-                     "Заметки", "Идея для бота", "Косметика", "Выйти")
+                     "Заметки", "Идея для бота", "Косметика", "Готовые посты", "Выйти")
 
 def is_menu_command(text):
     text = (text or "").strip()
@@ -162,8 +162,11 @@ def main_keyboard_for(owner):
         row2 = row2 + [KeyboardButton("🛠 Идея для бота")]
     if owner in COSMETICS_OWNERS:
         row2 = row2 + [KeyboardButton("💄 Косметика")]
+    rows = [[KeyboardButton("📋 Меню"), KeyboardButton("📊 Дашборд"), KeyboardButton("📅 Сегодня")], row2]
+    if owner in BLOG_OWNERS:
+        rows.append([KeyboardButton("✍️ Готовые посты")])
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("📋 Меню"), KeyboardButton("📊 Дашборд"), KeyboardButton("📅 Сегодня")], row2],
+        rows,
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -1004,6 +1007,90 @@ def append_kopilka_comment(location, comment):
         return
     current = ws.acell(f"D{row}").value or ""
     ws.update(f"D{row}", [[f"{current}\n💬 {comment}".strip()]])
+
+# ── Готовые посты ─────────────────────────────────────────────────
+# Лист заполняет Claude Code (скилл planner-notes), бот только присылает
+# тексты со статусом «готов» и меняет статус по кнопке.
+POSTS_SHEET  = "✍️ Готовые посты"
+POSTS_HEADER = ["Дата", "Тема", "Текст для Instagram", "Текст для Threads",
+                "Что снять / фото", "Статус", "Опубликован"]
+POSTS_SHOW_LIMIT = 5
+
+def get_ready_posts():
+    """[(номер строки, словарь полей)] со статусом «готов», новые сверху."""
+    try:
+        ws = get_sheet().worksheet(POSTS_SHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        return []
+    result = []
+    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+        date, topic, insta, threads, shoot, status = (row + [""] * 7)[:6]
+        if status.strip() == "готов" and (insta.strip() or threads.strip()):
+            result.append((i, {"date": date, "topic": topic, "insta": insta,
+                               "threads": threads, "shoot": shoot,
+                               "key": _post_key(topic, insta)}))
+    return list(reversed(result))
+
+def _post_key(topic, insta):
+    # Кнопка помнит номер строки; ключ проверяет, что в строке тот же пост,
+    # если в таблице строки успели вставить, удалить или пересортировать.
+    return format(zlib.crc32(f"{topic}\n{insta}".encode("utf-8")), "08x")
+
+def set_post_status(row, key, status, owner):
+    """False, если строка уже не «готов» или в ней теперь другой пост."""
+    ws = get_sheet().worksheet(POSTS_SHEET)
+    cells = (ws.get(f"B{row}:F{row}") or [[]])[0] + [""] * 5
+    topic, insta, status_now = cells[0], cells[1], cells[4]
+    if status_now.strip() != "готов" or _post_key(topic, insta) != key:
+        return False
+    published = now_for(owner).strftime("%d.%m.%Y") if status == "опубликован" else ""
+    ws.update(f"F{row}:G{row}", [[status, published]])
+    return True
+
+async def send_ready_posts(update, owner):
+    posts = get_ready_posts()
+    if not posts:
+        await update.message.reply_text("✍️ Готовых постов пока нет.")
+        return
+    shown = posts[:POSTS_SHOW_LIMIT]
+    more = f" Показываю {len(shown)} последних." if len(posts) > len(shown) else ""
+    await update.message.reply_text(f"✍️ Готовых постов: {len(posts)}.{more}\n"
+                                    "Текст — долгое нажатие → «Копировать».")
+    for row, p in shown:
+        # Без parse_mode: подписи с «_» и «*» не должны ломаться
+        await update.message.reply_text(f"📌 {p['topic'] or 'Без темы'} · {p['date']}")
+        if p["insta"].strip():
+            for chunk in split_into_telegram_chunks(p["insta"]):
+                await update.message.reply_text(chunk)
+        if p["threads"].strip():
+            await update.message.reply_text("🧵 Threads:")
+            for chunk in split_into_telegram_chunks(p["threads"]):
+                await update.message.reply_text(chunk)
+        footer = f"🎬 {p['shoot']}" if p["shoot"].strip() else "Отметь, когда выложишь:"
+        await update.message.reply_text(footer, reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Опубликован", callback_data=f"post_pub_{row}_{p['key']}"),
+            InlineKeyboardButton("⏸ Отложить", callback_data=f"post_hold_{row}_{p['key']}")]]))
+
+async def posts_callback(query, owner, data):
+    if owner not in BLOG_OWNERS:
+        return
+    parts = data.split("_")
+    if len(parts) != 4:
+        return
+    action, row, key = parts[1], int(parts[2]), parts[3]
+    status = "опубликован" if action == "pub" else "отложен"
+    try:
+        changed = set_post_status(row, key, status, owner)
+    except Exception:
+        logger.exception("Could not update post status")
+        await query.edit_message_text("❌ Не удалось отметить, попробуй ещё раз.")
+        return
+    if not changed:
+        await query.edit_message_text("🤔 Этот пост уже отмечен или изменён в таблице — нажми «✍️ Готовые посты» заново.")
+    elif action == "pub":
+        await query.edit_message_text("✅ Отметила: опубликован.")
+    else:
+        await query.edit_message_text("⏸ Отложила — в списке готовых его больше не будет.")
 
 # «Поделиться» с комментарием присылает два сообщения почти одновременно:
 # комментарий (без ссылки) и саму ссылку/пост — в любом порядке. Всё, что
@@ -1940,6 +2027,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await enter_cosmetics_mode(update, owner)
         return
 
+    if "Готовые посты" in text and owner in BLOG_OWNERS:
+        try:
+            await send_ready_posts(update, owner)
+        except Exception:
+            logger.exception("Could not send ready posts")
+            await update.message.reply_text("❌ Не удалось прочитать готовые посты.")
+        return
+
     # Handle persistent keyboard buttons (match by keyword, since some
     # Telegram clients add/drop emoji variation selectors on the label)
     if "Меню" in text:
@@ -2023,6 +2118,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today   = today_for(owner)
     if data.startswith("cos_"):
         await cosmetics_callback(query, user_id, owner, data)
+    elif data.startswith("post_"):
+        await posts_callback(query, owner, data)
     elif data.startswith("cat_"):
         category = data.replace("cat_", "")
         if user_id in user_states:
@@ -2392,6 +2489,9 @@ def help_text_for(owner):
         *(["*💄 Косметика:* нажми кнопку и говори «купила / открыла / закончилась / подарила …» или пришли фото баночки. "
            "Там же списки запаса и открытого, сроки, сравнение цен и реакции. По понедельникам напомню, что скоро истекает.", ""]
           if owner in COSMETICS_OWNERS else []),
+        *(["*✍️ Готовые посты:* пришлю тексты, которые Claude подготовил к публикации, — копируешь долгим нажатием, "
+           "потом жмёшь «✅ Опубликован».", ""]
+          if owner in BLOG_OWNERS else []),
         "*Копилка:* перешли мне пост или пришли ссылку (из Инстаграма — «Поделиться» → Телеграм → я) — положу в копилку, а не в задачи.",
         "",
         "Что-то пошло не так — пришли /start, он сбросит все режимы.",
