@@ -4,7 +4,7 @@
 Без библиотеки groq — прямые HTTP запросы
 """
 
-import os, re, time, logging, json, tempfile, base64, asyncio, calendar, requests, zlib
+import os, re, io, time, logging, json, tempfile, base64, asyncio, calendar, requests, zlib, subprocess
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = ("Починила кнопки: «→ Перенести» в вечернем списке снова предлагает «Завтра / Другой день», а если бот вдруг перестанет отвечать на кнопки, он сам перезапустится через несколько минут. Это сообщение теперь приходит только при настоящих изменениях, а не при каждом перезапуске.")
+LATEST_CHANGE_NOTE = ("«📊 Дашборд (неделя)» теперь присылает неделю картинкой прямо в чат: после переезда бота на домашний компьютер ссылка на страницу перестала открываться. На картинке сразу задачи всех 7 дней, привычки и цели. Ещё починила кнопки: «→ Перенести» в вечернем списке снова работает, а если бот перестанет отвечать на кнопки, он сам перезапустится через несколько минут.")
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -2156,6 +2156,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await habits_command(update, context)
     elif data == "menu_help":
         await help_command(update, context)
+    elif data == "menu_dash":
+        await send_dashboard_picture(query, owner)
     elif data == "menu_week":
         await week_text_command(update, context)
     elif data == "menu_goals":
@@ -2347,9 +2349,8 @@ async def table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update): return
     owner = owner_for(update)
     keyboard = []
-    dashboard_url = DASHBOARD_URLS.get(owner)
-    if dashboard_url:
-        keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", url=dashboard_url)])
+    if owner in DASHBOARD_URLS:
+        keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", callback_data="menu_dash")])
     # Таблица общая на всех: там листы, привычки и цели каждого. Поэтому
     # ссылку на неё видит только администратор, остальным — свой дашборд.
     keyboard.append([InlineKeyboardButton("🗓 Неделя текстом (без браузера)", callback_data="menu_week")])
@@ -2528,9 +2529,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🗓 Неделя текстом", callback_data="menu_week")],
         [InlineKeyboardButton("❓ Как мной пользоваться", callback_data="menu_help")],
     ]
-    dashboard_url = DASHBOARD_URLS.get(owner)
-    if dashboard_url:
-        keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", url=dashboard_url)])
+    if owner in DASHBOARD_URLS:
+        keyboard.append([InlineKeyboardButton("📊 Дашборд (неделя)", callback_data="menu_dash")])
     if owner in BOT_ADMIN_OWNERS:
         keyboard.append([InlineKeyboardButton("🗓 Открыть таблицу", url=SPREADSHEET_URL)])
     await update.message.reply_text(
@@ -3347,8 +3347,86 @@ def render_dashboard_page(owner, data):
     html = html.replace("@@ACCENT_BG_DARK@@", style["accent_bg_dark"])
     html = html.replace("@@ACCENT_BG@@", style["accent_bg"])
     html = html.replace("@@ACCENT@@", style["accent"])
-    html = html.replace("@@DATA_JSON@@", json.dumps(data, ensure_ascii=False))
+    # "</" экранируем: текст задачи с «</script>» не должен закрыть тег с данными
+    html = html.replace("@@DATA_JSON@@", json.dumps(data, ensure_ascii=False).replace("</", "<\\/"))
     return html
+
+# ── Дашборд картинкой ──
+# С 03.10.2026 бот живёт на ноутбуке Оли, а до ноутбука из интернета не
+# достучаться — ссылка на страницу больше не открывается. Поэтому по
+# кнопке бот делает снимок той же страницы установленным Chrome и
+# присылает картинкой. На снимке нельзя листать дни и таблицу, поэтому
+# перед снимком страница перестраивается: задачи всех 7 дней сразу,
+# таблица привычек во всю ширину.
+CHROME_PATH = os.getenv("CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+DASHBOARD_SNAPSHOT_EXTRA = """
+<style>
+  .wrap { max-width: 1250px; }
+  .habit-scroll { overflow: visible; }
+  nav.week-strip, footer { display: none; }
+  .all-days { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 28px; }
+  .all-days .day-head { font-weight: 600; margin: 10px 0 2px; color: var(--today); }
+</style>
+<script>
+(function () {
+  var strip = document.getElementById('week-strip'), content = document.getElementById('content');
+  var all = document.createElement('div');
+  all.className = 'all-days';
+  Array.prototype.forEach.call(strip.children, function (btn) {
+    btn.click();
+    var day = document.createElement('div');
+    var head = document.createElement('div');
+    head.className = 'day-head';
+    var d = btn.getAttribute('data-date') || '';
+    head.textContent = (btn.querySelector('.dow') || btn).textContent.trim().slice(0, 2).toUpperCase() + ' ' + d.slice(0, 5);
+    day.appendChild(head);
+    Array.prototype.forEach.call(content.children, function (el) { day.appendChild(el.cloneNode(true)); });
+    all.appendChild(day);
+  });
+  content.replaceWith(all);
+})();
+</script>
+"""
+
+def dashboard_png(owner):
+    """Снимок дашборда (PNG, байты) или None. Синхронная — звать через asyncio.to_thread."""
+    from PIL import Image
+    fresh = time.time() - _dashboard_last_refresh.get(owner, 0) < 300 and owner in DASHBOARD_CACHE
+    html = DASHBOARD_CACHE[owner] if fresh else render_dashboard_page(owner, build_dashboard_data(owner))
+    html = html.replace("</body>", DASHBOARD_SNAPSHOT_EXTRA + "</body>")
+    with tempfile.TemporaryDirectory() as tmp:
+        page = os.path.join(tmp, "dashboard.html")
+        shot = os.path.join(tmp, "dashboard.png")
+        with open(page, "w", encoding="utf-8") as f:
+            f.write(html)
+        subprocess.run([CHROME_PATH, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+                        "--force-device-scale-factor=1.5", "--window-size=1300,4000",
+                        "--virtual-time-budget=6000", f"--user-data-dir={os.path.join(tmp, 'profile')}",
+                        f"--screenshot={shot}", "file:///" + page.replace("\\", "/")],
+                       timeout=120, capture_output=True)
+        if not os.path.exists(shot):
+            return None
+        im = Image.open(shot).convert("RGB")
+        w, h = im.size
+        bg, px, y = im.getpixel((w - 2, h - 2)), im.load(), h - 1
+        while y > 0 and all(px[x, y] == bg for x in range(0, w, 7)):
+            y -= 1  # обрезаем пустой фон снизу
+        out = io.BytesIO()
+        im.crop((0, 0, w, min(h, y + 40))).save(out, format="PNG")
+        return out.getvalue()
+
+async def send_dashboard_picture(query, owner):
+    note = await query.message.reply_text("📊 Собираю дашборд, это секунд 20–30…")
+    try:
+        png = await asyncio.to_thread(dashboard_png, owner)
+    except Exception:
+        logger.exception(f"Не удалось сделать снимок дашборда для {owner}")
+        png = None
+    if png:
+        await query.message.reply_photo(png, caption="📊 Неделя")
+        await note.delete()
+    else:
+        await note.edit_text("🤔 Не получилось собрать картинку — нажми «🗓 Неделя текстом».")
 
 async def refresh_dashboard_cache(owner):
     if owner not in DASHBOARD_URLS:
@@ -4599,7 +4677,8 @@ async def main_async():
     if DASHBOARD_URLS:
         app.job_queue.run_repeating(refresh_all_dashboards, interval=300, first=15)
 
-    dashboard_runner = await start_dashboard_server() if DASHBOARD_URLS else None
+    # веб-страница нужна только там, где до бота можно достучаться из интернета (Railway)
+    dashboard_runner = await start_dashboard_server() if DASHBOARD_URLS and os.getenv("DASHBOARD_SERVER") == "1" else None
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
