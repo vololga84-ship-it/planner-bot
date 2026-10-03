@@ -18,6 +18,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from aiohttp import web
+import mail_digest
 
 load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = "Для блога: новая кнопка «✍️ Готовые посты» — присылает готовые тексты отдельными сообщениями (долгое нажатие → копировать), под каждым кнопки «✅ Опубликован» и «⏸ Отложить»."
+LATEST_CHANGE_NOTE = "Для Оли, почта: в 9, 12, 15, 18 и 21 час бот присылает короткую выжимку новых писем из Mail.ru и Gmail — важное отдельно сверху."
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -4497,6 +4498,35 @@ async def run_cosmetics_reminder(context: ContextTypes.DEFAULT_TYPE):
     for chunk in split_into_telegram_chunks("💄 Косметика — сроки на эту неделю:\n\n" + text):
         await context.bot.send_message(chat_id=int(chat_id), text=chunk)
 
+# ── Выжимка почты ─────────────────────────────────────────────
+# Mail.ru («Входящие» с подпапками) + собранные в него ящики Gmail. Каждый
+# запуск берёт письма с прошлого слота: в 9:00 — с 21:00 вчерашнего дня,
+# в остальные — за 3 часа. Окно считается от времени по расписанию, а не
+# из сохранённого состояния, поэтому перезапуск бота ничего не дублирует.
+MAIL_DIGEST_OWNERS = set(o.strip() for o in os.getenv("MAIL_DIGEST_OWNERS", "Оля").split(",") if o.strip())
+MAIL_DIGEST_HOURS = (9, 12, 15, 18, 21)
+MAILRU_USER = os.getenv("MAILRU_USER", "vololga84@mail.ru")
+MAILRU_APP_PASSWORD = os.getenv("MAILRU_APP_PASSWORD")
+
+async def run_mail_digest(context: ContextTypes.DEFAULT_TYPE):
+    owner, hour = context.job.data
+    chat_id = next((tid for tid, name in USER_NAMES.items() if name == owner), None)
+    if not chat_id:
+        return
+    tz = tz_for(owner)
+    until = datetime.now(tz).replace(hour=hour, minute=0, second=0, microsecond=0)
+    since = until - timedelta(hours=12 if hour == MAIL_DIGEST_HOURS[0] else 3)
+    try:
+        text = await asyncio.to_thread(mail_digest.make_digest, MAILRU_USER, MAILRU_APP_PASSWORD, GROQ_API_KEY,
+                                       "qwen/qwen3.8-27b", since, until, tz)
+    except Exception:
+        logger.exception("Почта: выжимка не собралась")
+        return
+    if not text:
+        return
+    for chunk in split_into_telegram_chunks(text):
+        await context.bot.send_message(chat_id=int(chat_id), text=chunk, disable_web_page_preview=True)
+
 # ── Main ───────────────────────────────────────────────────────
 async def main_async():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -4531,6 +4561,11 @@ async def main_async():
     for owner in COSMETICS_OWNERS & set(ALL_OWNERS):
         app.job_queue.run_daily(run_cosmetics_reminder, time=dt_time(hour=10, minute=0, tzinfo=tz_for(owner)),
                                 data=owner, name=f"cosmetics-{owner}")
+    if MAILRU_APP_PASSWORD:
+        for owner in MAIL_DIGEST_OWNERS & set(ALL_OWNERS):
+            for hour in MAIL_DIGEST_HOURS:
+                app.job_queue.run_daily(run_mail_digest, time=dt_time(hour=hour, minute=1, tzinfo=tz_for(owner)),
+                                        data=(owner, hour), name=f"mail-{owner}-{hour}")
     app.job_queue.run_daily(run_bot_ideas_digest, time=dt_time(hour=21, minute=2, tzinfo=ZoneInfo(DEFAULT_TIMEZONE)))
     app.job_queue.run_repeating(check_reminders, interval=REMINDER_CHECK_INTERVAL, first=10)
     if DASHBOARD_URLS:
