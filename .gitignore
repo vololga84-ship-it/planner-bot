@@ -10,3 +10,4 @@ dashboard_full.json
 # Локальный запуск на компьютере
 .venv/
 bot_local.log
+.last_change_note

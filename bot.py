@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = ("Бот переехал с зарубежного сервера на домашний компьютер Оли: на сервере заканчивался бесплатный период, а продлевать его можно только зарубежной картой. Снаружи ничего не поменялось, но теперь бот работает, пока компьютер Оли включён — если он ненадолго замолчит, значит компьютер выключен или пропал интернет.")
+LATEST_CHANGE_NOTE = ("Починила кнопки: «→ Перенести» в вечернем списке снова предлагает «Завтра / Другой день», а если бот вдруг перестанет отвечать на кнопки, он сам перезапустится через несколько минут. Это сообщение теперь приходит только при настоящих изменениях, а не при каждом перезапуске.")
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -2098,6 +2099,21 @@ async def _remove_checklist_row(query, date_str, row_num):
     await query.edit_message_reply_markup(InlineKeyboardMarkup(new_rows) if new_rows else None)
     return new_rows
 
+def postpone_choice_keyboard(markup, data, date_str, row_num):
+    """Строку с нажатой «Перенести» заменяет на «Завтра / Другой день».
+    В вечернем чек-листе «Перенести» стоит вторым в строке после
+    «✅ Сделано», поэтому ищем кнопку во всей строке, а не только первую."""
+    new_keyboard = []
+    for row in markup.inline_keyboard:
+        if any(btn.callback_data == data for btn in row):
+            new_keyboard.append([
+                InlineKeyboardButton("📅 Завтра", callback_data=f"evtmrw_{date_str}_{row_num}"),
+                InlineKeyboardButton("✏️ Другой день", callback_data=f"evcust_{date_str}_{row_num}"),
+            ])
+        else:
+            new_keyboard.append(row)
+    return InlineKeyboardMarkup(new_keyboard)
+
 def _rows_without(markup, date_str, row_num):
     suffix = f"_{date_str}_{row_num}"
     return [row for row in markup.inline_keyboard
@@ -2112,7 +2128,12 @@ habit_fill_markups = {}
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest:
+        # Нажали, пока бот перезапускался: Telegram уже не принимает ответ
+        # на это нажатие («Query is too old»), но само действие выполнить надо.
+        pass
     user_id = str(update.effective_user.id)
     owner   = owner_for(update)
     data    = query.data
@@ -2221,16 +2242,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("evpost_"):
         _, date_str, row_str = data.split("_", 2)
         row_num = int(row_str)
-        new_keyboard = []
-        for row in query.message.reply_markup.inline_keyboard:
-            if row and row[0].callback_data == data:
-                new_keyboard.append([
-                    InlineKeyboardButton("📅 Завтра", callback_data=f"evtmrw_{date_str}_{row_num}"),
-                    InlineKeyboardButton("✏️ Другой день", callback_data=f"evcust_{date_str}_{row_num}"),
-                ])
-            else:
-                new_keyboard.append(row)
-        await query.edit_message_reply_markup(InlineKeyboardMarkup(new_keyboard))
+        await query.edit_message_reply_markup(
+            postpone_choice_keyboard(query.message.reply_markup, data, date_str, row_num))
     elif data.startswith("evtmrw_"):
         _, date_str, row_str = data.split("_", 2)
         row_num  = int(row_str)
@@ -3434,7 +3447,22 @@ async def notify_users_about_restart(app):
     сообщаем всем участникам, что стоит прислать /start: клавиатура с
     кнопками у Telegram кешируется на стороне клиента и не обновится
     сама, если поменялись кнопки или сброшено какое-то состояние."""
+    # На домашнем компьютере бот перезапускается и без новой версии (сторож,
+    # перезагрузка ноутбука, пропал VPN) — пишем всем только когда
+    # LATEST_CHANGE_NOTE новый. Последнюю отправленную запоминаем в файле.
+    sent_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_change_note")
+    try:
+        with open(sent_file, encoding="utf-8") as f:
+            if f.read() == LATEST_CHANGE_NOTE:
+                return
+    except OSError:
+        pass
     note = f"\n\nЧто изменилось: {LATEST_CHANGE_NOTE}" if LATEST_CHANGE_NOTE else ""
+    try:
+        with open(sent_file, "w", encoding="utf-8") as f:
+            f.write(LATEST_CHANGE_NOTE)
+    except OSError:
+        logger.exception("Не удалось запомнить отправленную новость")
     for telegram_id in USER_NAMES:
         try:
             await app.bot.send_message(
