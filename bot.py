@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = ("«📊 Дашборд (неделя)» теперь присылает неделю картинкой прямо в чат: после переезда бота на домашний компьютер ссылка на страницу перестала открываться. На картинке сразу задачи всех 7 дней, привычки и цели. Ещё починила кнопки: «→ Перенести» в вечернем списке снова работает, а если бот перестанет отвечать на кнопки, он сам перезапустится через несколько минут.")
+LATEST_CHANGE_NOTE = ("Витамины: «убери магний из витаминов утром» теперь убирает именно из утренних (раньше бот мог убрать из вечерних, если там было то же самое), а лишние кавычки в списке больше не появляются.")
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -495,7 +495,10 @@ def split_supplements(value):
     """Список из «магний-2, цинк-1» и из «магний и цинк»: голосом люди
     перечисляют через «и» и «плюс» не реже, чем через запятую."""
     parts = re.split(r",|;|\bи\b|\bплюс\b|\+", value or "")
-    return [part.strip(" .") for part in parts if part.strip(" .")]
+    # Кавычки срезаем: 04.10.2026 в набор попал список в «ёлочках», и
+    # «глутамин-1»» с кавычкой тянулся пунктом во все ответы.
+    junk = " .«»\"'“”„"
+    return [part.strip(junk) for part in parts if part.strip(junk)]
 
 def _supplement_key(item):
     """Название без дозы: «магний-2» и «магний 3» — одно и то же."""
@@ -1499,27 +1502,51 @@ async def write_to_sheet(message, func, *args):
         await asyncio.sleep(20)
         return await asyncio.to_thread(func, *args)
 
+def _stems(text, n=5):
+    return {w[:n] for w in re.split(r"[^0-9a-zA-Zа-яёА-ЯЁ]+", (text or "").lower()) if len(w) > 2}
+
+def pick_supplement_removal(remembered, owner, query):
+    """Из какого набора и что убрать: (набор, убранные пункты, оставшиеся) или None.
+    Если набор назван («утром», «вечерних») — ищем только в нём. Раньше
+    брался первый набор, где нашёлся такой пункт, и «убери магний из
+    витаминов утром» убирало магний из вечернего (мама, 04.10.2026)."""
+    sets = [(habit, value) for (set_owner, habit), value in remembered.items()
+            if set_owner == owner and is_supplement_habit(habit)]
+    if not sets:
+        return None
+    # Название набора сравниваем по первым трём буквам: «утро», «утром»,
+    # «утренние» — всё «утр», «вечером» и «вечерних» — «веч».
+    query_stems = _stems(query, 3)
+    common = set.intersection(*(_stems(h, 3) for h, _ in sets))  # «витамины» есть во всех названиях
+    named = [(h, v) for h, v in sets if (_stems(h, 3) - common) & query_stems]
+    name_stems = set().union(*(_stems(h) for h, _ in sets))
+    words = [w for w in re.split(r"[^0-9a-zA-Zа-яёА-ЯЁ]+", (query or "").lower())
+             if len(w) > 2 and w[:5] not in name_stems]
+    if not words:
+        return None
+    for habit, value in (named or sets):
+        items = split_supplements(value)
+        # «омегу» ищет «омега»: падежное окончание отбрасываем
+        hit = [item for item in items
+               if any(word in _supplement_key(item) or (len(word) >= 5 and word[:-1] in _supplement_key(item))
+                      for word in words)]
+        if hit:
+            return habit, hit, [item for item in items if item not in hit]
+    return None
+
 async def remove_from_supplement_set(update, owner, date_str, query):
     """«убери цинк из витаминов» — это не удаление записи целиком, а одного
     пункта из списка добавок. Убираем его и из запомненного набора, и из
     записи за день. Возвращает True, если что-то убрали."""
-    words = [w for w in re.split(r"[^0-9a-zA-Zа-яёА-ЯЁ]+", (query or "").lower()) if len(w) > 2]
-    if not words:
-        return False
     try:
         remembered = get_remembered()
     except Exception:
         logger.exception("Не удалось прочитать наборы перед удалением")
         return False
 
-    for (set_owner, habit_name), value in remembered.items():
-        if set_owner != owner or not is_supplement_habit(habit_name):
-            continue
-        items = split_supplements(value)
-        hit = [item for item in items if any(word in _supplement_key(item) for word in words)]
-        if not hit:
-            continue
-        kept = [item for item in items if item not in hit]
+    picked = pick_supplement_removal(remembered, owner, query)
+    if picked:
+        habit_name, hit, kept = picked
         new_value = ", ".join(kept)
         remember_value(owner, habit_name, new_value)
         # Если этот пункт записан и за сегодня — убираем и оттуда.
