@@ -163,7 +163,7 @@ def main_keyboard_for(owner):
     if owner not in BOT_ADMIN_OWNERS:
         row2 = row2 + [KeyboardButton("🛠 Идея для бота")]
     if owner in COSMETICS_OWNERS:
-        row2 = row2 + [KeyboardButton("💄 Косметика")]
+        row2 = row2 + [KeyboardButton("🧴 Косметика")]
     rows = [[KeyboardButton("📋 Меню"), KeyboardButton("📊 Дашборд"), KeyboardButton("📅 Сегодня")], row2]
     if owner in BLOG_OWNERS:
         rows.append([KeyboardButton("✍️ Готовые посты")])
@@ -2528,7 +2528,7 @@ def help_text_for(owner):
         "",
         f"*Записать мысль, а не задачу:* {capture}. Вечером я сама разложу записанное и пришлю результат.",
         "",
-        *(["*💄 Косметика:* нажми кнопку и говори «купила / открыла / закончилась / подарила …» или пришли фото баночки. "
+        *(["*🧴 Косметика:* нажми кнопку и говори «купила / открыла / закончилась / подарила …» или пришли фото баночки. "
            "Там же списки запаса и открытого, сроки, сравнение цен и реакции. По понедельникам напомню, что скоро истекает.", ""]
           if owner in COSMETICS_OWNERS else []),
         *(["*✍️ Готовые посты:* пришлю тексты, которые Claude подготовил к публикации, — копируешь долгим нажатием, "
@@ -3584,7 +3584,7 @@ async def notify_users_about_restart(app):
 # Отдельный режим с кнопкой, как у заметок: без него «закончилась
 # сыворотка» ушла бы в задачи, а «закончила» — в разбор витаминов.
 COSMETICS_OWNERS = set(o.strip() for o in os.getenv("COSMETICS_OWNERS", "Оля").split(",") if o.strip())
-COSMETICS_SHEET = "💄 Косметика"
+COSMETICS_SHEET = "🧴 Косметика"
 COS_FIELDS = ["block", "name", "format", "volume", "unit", "price", "price_kind", "site_price", "box", "per_unit",
               "status", "expiry", "opened", "pao", "use_until", "finished", "lasted",
               "reaction", "comment"]
@@ -3738,7 +3738,7 @@ def save_cosmetics_batch(items):
 # Боксы: набор покупается за одну сумму, а цены отдельных средств
 # неизвестны. Сумму делим между средствами пропорционально их ценам на
 # корейском сайте бренда — курс валют для этого не нужен, важны только доли.
-COS_BOX_SHEET  = "💄 Боксы"
+COS_BOX_SHEET  = "🧴 Боксы"
 COS_BOX_HEADER = ["Бокс", "Дата", "Заплатила, ₽", "Средств", "Комментарий"]
 
 def get_box_sheet():
@@ -4241,7 +4241,7 @@ def _cos_safe(handler):
 async def enter_cosmetics_mode(update, owner):
     user_id = str(update.effective_user.id)
     cosmetics_mode_users.add(user_id)
-    text = ("💄 Режим «Косметика». Говори или пиши:\n"
+    text = ("🧴 Режим «Косметика». Говори или пиши:\n"
             "• «купила крем Round Lab 80 мл за 1500, годен до 03.2028»\n"
             "• «открыла тонер Anua, 12 месяцев»\n"
             "• «закончилась сыворотка Numbuzin»\n"
@@ -4628,7 +4628,7 @@ async def run_cosmetics_reminder(context: ContextTypes.DEFAULT_TYPE):
     text = render_cos_deadlines(items, now_for(owner).date())
     if not text:
         return
-    for chunk in split_into_telegram_chunks("💄 Косметика — сроки на эту неделю:\n\n" + text):
+    for chunk in split_into_telegram_chunks("🧴 Косметика — сроки на эту неделю:\n\n" + text):
         await context.bot.send_message(chat_id=int(chat_id), text=chunk)
 
 # ── Выжимка почты ─────────────────────────────────────────────
