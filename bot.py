@@ -3954,6 +3954,18 @@ def _find_scored(items, name, statuses, all_items=None):
 def find_cosmetics(items, name, statuses):
     return _find_scored(items, name, statuses)[1]
 
+def find_photo_cosmetics(items, name, statuses):
+    """С фото название читается целиком, поэтому совпадение бренда и пары
+    слов — не то же средство: «COSRX Clear Fit Master Patch» не
+    «COSRX Acne Pimple Master Patch». Своё — только если одно название
+    целиком входит в другое."""
+    photo = _cos_words(name)
+    def same(it):
+        words = _cos_words(it["name"])
+        return (all(any(_cos_word_match(q, w) for w in words) for q in photo)
+                or all(any(_cos_word_match(w, q) for q in photo) for w in words))
+    return [it for it in find_cosmetics(items, name, statuses) if same(it)]
+
 # В каком порядке искать средство для действия: сначала среди самых
 # вероятных статусов, потом среди остальных.
 COS_SEARCH_ORDER = {
@@ -4504,7 +4516,7 @@ async def cosmetics_photo(update, context, owner):
 
     if len(found) == 1:
         photo_item = found[0]
-        known = find_cosmetics(items, photo_item["name"], [COS_STOCK, COS_OPEN, COS_DONE])
+        known = find_photo_cosmetics(items, photo_item["name"], [COS_STOCK, COS_OPEN, COS_DONE])
         if known:
             it = known[0]
             cos_set_last(user_id, row=it["row"])
@@ -4532,7 +4544,7 @@ async def cosmetics_photo(update, context, owner):
                 InlineKeyboardButton("🧴 Открыла сегодня", callback_data="cos_new_open")]]))
         return
 
-    new = [f for f in found if not find_cosmetics(items, f["name"], [COS_STOCK, COS_OPEN])]
+    new = [f for f in found if not find_photo_cosmetics(items, f["name"], [COS_STOCK, COS_OPEN])]
     lines = [f"На фото {len(found)} средств:"]
     lines += [f"• {f['name']}" + ("" if f in new else " — уже есть в учёте") for f in found]
     if not new:
