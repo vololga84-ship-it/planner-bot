@@ -4709,6 +4709,18 @@ def cos_review_set(item, field, value, note=None):
     save_cosmetic(item)
     return item
 
+def _cos_until_reason(it):
+    """Какая из двух дат главнее: срок с упаковки или дата вскрытия + срок после вскрытия."""
+    until, expiry = _cos_date(it.get("use_until")), _cos_date(it.get("expiry"))
+    pao = _cos_num(it.get("pao"))
+    if not until:
+        return ""
+    if it.get("opened") and pao and (not expiry or until < expiry):
+        return f" (главнее вскрытие: {it['opened']} + {_cos_fmt_num(pao)} мес)"
+    if not it.get("opened") and it["status"] == COS_OPEN:
+        return " (пока только срок с упаковки — дата вскрытия неизвестна, на деле может быть раньше)"
+    return " (по сроку с упаковки)"
+
 def cos_review_card(cat, it, today, total):
     head = {"A": _cos_left(it.get("use_until") or it.get("expiry"), today) + ". Даты верные?",
             "B": "📅 Открыто, но нет даты вскрытия. Когда открыла?",
@@ -4727,7 +4739,7 @@ def cos_review_card(cat, it, today, total):
         lines.append(f"🏭 Изготовлено: {made.group(1)}")
     lines += [f"Годен до: {it.get('expiry') or '—'}",
               f"Открыто: {it.get('opened') or '—'}" + (f", после вскрытия {it['pao']} мес" if it.get("pao") else ""),
-              f"Использовать до: {it.get('use_until') or '—'}", "", head, f"(в очереди ещё {total - 1})"]
+              f"Использовать до: {it.get('use_until') or '—'}{_cos_until_reason(it)}", "", head, f"(в очереди ещё {total - 1})"]
     return "\n".join(lines)
 
 def cos_review_keyboard(cat, it):
