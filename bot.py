@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = ("Косметика: у каждого средства теперь есть место (ванная / комната / гардероб). Кнопка «📍 Переместить», под списками «Запас» и «Открыто» — фильтр по месту. Режим «Косметика» больше не сбрасывается при обновлении бота.")
+LATEST_CHANGE_NOTE = ("Косметика: «📍 Переместить» теперь двигает и между статусами — запас, открыто, закончилось, выброшено, подарено — и между местами (ванная / комната / гардероб).")
 
 # Кому уходит LATEST_CHANGE_NOTE: None — всем участникам; {"Оля"} — только ей
 # (правка в блоке, который видит только она, например «Косметика»: маме и
@@ -4348,7 +4348,7 @@ async def cosmetics_text(update, text, owner):
         return
     if _cos_button(text, "Переместить"):
         items = await write_to_sheet(message, load_cosmetics)
-        text_menu, markup_menu = cos_open_menu(items, "m")
+        text_menu, markup_menu = cos_move_status_menu(items)
         await message.reply_text(text_menu, reply_markup=markup_menu)
         return
     if _cos_button(text, "Открыть из запаса"):
@@ -4666,7 +4666,7 @@ async def cosmetics_callback(query, user_id, owner, data):
     if data.startswith("cos_rv_"):
         await cos_review_callback(query, user_id, owner, data, items)
         return
-    if re.match(r"cos_(o[bid]|m[bip]|pf)_", data):
+    if re.match(r"cos_(o[bid]|m[bipst]|pf)_", data):
         await cos_open_callback(query, user_id, owner, data, items)
         return
 
@@ -4889,24 +4889,57 @@ def cos_place_filter(items, code, status):
                for k, p in enumerate(COS_PLACES) if (n := counts[p])]
     return InlineKeyboardMarkup([buttons]) if buttons else None
 
-def cos_open_menu(items, mode="o"):
-    """(текст, кнопки): разделы с числом средств; mode o — запас (открыть), m — запас и открытое (переместить)."""
-    stock = [it for it in items if it["status"] in ((COS_STOCK,) if mode == "o" else (COS_STOCK, COS_OPEN))]
+COS_MOVE_STATUSES = [(COS_STOCK, "📦 В запасе"), (COS_OPEN, "🧴 Открыто"), (COS_DONE, "✅ Закончилось"),
+                     (COS_TRASH, "🗑 Выброшено"), (COS_GIFT, "🎁 Подарено")]
+
+def cos_move_status_menu(items):
+    """(текст, кнопки): откуда берём средство для переноса — по статусам."""
+    buttons = []
+    for si, (status, label) in enumerate(COS_MOVE_STATUSES):
+        n = sum(1 for it in items if it["status"] == status)
+        if n:
+            buttons.append(InlineKeyboardButton(f"{label} ({n})", callback_data=f"cos_ms_{si}"))
+    if not buttons:
+        return "Пока ничего нет.", None
+    return "📍 Что переложить? Сначала где оно сейчас:", InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+
+def cos_move_status(item, new_status, today_str):
+    """Переносит средство в другой статус (запас, открыто, закончилось, выбросила, подарила)."""
+    if new_status == COS_STOCK:
+        item["status"], item["opened"], item["finished"], item["lasted"] = COS_STOCK, "", "", ""
+        save_cosmetic(item)
+        return f"📦 {_cos_title(item)}: вернула в запас.", []
+    action = {COS_OPEN: "open", COS_DONE: "finish", COS_TRASH: "discard", COS_GIFT: "gift"}[new_status]
+    parsed = {"action": action}
+    if new_status == COS_OPEN and item.get("opened"):
+        parsed["date"] = item["opened"]   # дату вскрытия не затираем
+    return apply_cosmetic(item, parsed, today_str)
+
+def cos_open_menu(items, mode="o", si=0):
+    """(текст, кнопки): разделы с числом средств; mode o — запас (открыть), m — перенос из статуса №si."""
+    status = COS_MOVE_STATUSES[si][0] if mode == "m" and 0 <= si < len(COS_MOVE_STATUSES) else COS_STOCK
+    stock = [it for it in items if it["status"] == (COS_STOCK if mode == "o" else status)]
     names = COS_BLOCKS + ["Без блока"]
     buttons = []
     for i, name in enumerate(names):
         n = sum(1 for it in stock if _cos_block_of(it) == name)
         if n:
-            buttons.append(InlineKeyboardButton(f"{name} ({n})", callback_data=f"cos_{mode}b_{i}_0"))
+            buttons.append(InlineKeyboardButton(f"{name} ({n})", callback_data=(
+                f"cos_ob_{i}_0" if mode == "o" else f"cos_mb_{si}_{i}_0")))
     if not buttons:
         return "Пока ничего нет.", None
-    return ("Из какого раздела открыла?" if mode == "o" else "Что переложить? Выбери раздел:"), InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+    if mode == "m":
+        buttons.append(InlineKeyboardButton("↩️ Статусы", callback_data="cos_ms_menu"))
+    return ("Из какого раздела открыла?" if mode == "o" else f"{COS_MOVE_STATUSES[si][1]}. Выбери раздел:"), InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
 
-def cos_open_block(items, block_index, page, mode="o"):
+def _cos_nav(mode, si, block_index, page):
+    return f"cos_ob_{block_index}_{page}" if mode == "o" else f"cos_mb_{si}_{block_index}_{page}"
+
+def cos_open_block(items, block_index, page, mode="o", si=0):
     names = COS_BLOCKS + ["Без блока"]
     if not 0 <= block_index < len(names):
-        return cos_open_menu(items, mode)
-    statuses = (COS_STOCK,) if mode == "o" else (COS_STOCK, COS_OPEN)
+        return cos_open_menu(items, mode, si)
+    statuses = (COS_STOCK,) if mode == "o" else (COS_MOVE_STATUSES[si][0],)
     name = names[block_index]
     far = datetime.max.date()
     group = sorted((it for it in items if it["status"] in statuses and _cos_block_of(it) == name),
@@ -4917,10 +4950,10 @@ def cos_open_block(items, block_index, page, mode="o"):
                for it in group[page * COS_OPEN_PAGE:(page + 1) * COS_OPEN_PAGE]]
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"cos_{mode}b_{block_index}_{page - 1}"))
-    nav.append(InlineKeyboardButton("↩️ Разделы", callback_data=f"cos_{mode}b_menu"))
+        nav.append(InlineKeyboardButton("⬅️", callback_data=_cos_nav(mode, si, block_index, page - 1)))
+    nav.append(InlineKeyboardButton("↩️ Разделы", callback_data="cos_ob_menu" if mode == "o" else f"cos_mb_{si}_menu"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"cos_{mode}b_{block_index}_{page + 1}"))
+        nav.append(InlineKeyboardButton("➡️", callback_data=_cos_nav(mode, si, block_index, page + 1)))
     buttons.append(nav)
     ask = "что открыла? (сначала те, у кого срок раньше)" if mode == "o" else "что переложить?"
     return f"{name} — {ask} стр. {page + 1}/{pages}", InlineKeyboardMarkup(buttons)
@@ -4928,14 +4961,32 @@ def cos_open_block(items, block_index, page, mode="o"):
 @_cos_safe
 async def cos_open_callback(query, user_id, owner, data, items):
     message, today_str = query.message, today_for(owner)
-    m = re.fullmatch(r"cos_([om])b_menu", data)
-    if m:
-        text, markup = cos_open_menu(items, m.group(1))
+    if data in ("cos_ms_menu",):
+        text, markup = cos_move_status_menu(items)
         await query.edit_message_text(text, reply_markup=markup)
         return
-    m = re.fullmatch(r"cos_([om])b_(\d+)_(\d+)", data)
+    m = re.fullmatch(r"cos_ms_(\d)", data)
+    if m and int(m.group(1)) < len(COS_MOVE_STATUSES):
+        text, markup = cos_open_menu(items, "m", int(m.group(1)))
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+    if data == "cos_ob_menu":
+        text, markup = cos_open_menu(items, "o")
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+    m = re.fullmatch(r"cos_ob_(\d+)_(\d+)", data)
     if m:
-        text, markup = cos_open_block(items, int(m.group(2)), int(m.group(3)), m.group(1))
+        text, markup = cos_open_block(items, int(m.group(1)), int(m.group(2)), "o")
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+    m = re.fullmatch(r"cos_mb_(\d)_menu", data)
+    if m and int(m.group(1)) < len(COS_MOVE_STATUSES):
+        text, markup = cos_open_menu(items, "m", int(m.group(1)))
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+    m = re.fullmatch(r"cos_mb_(\d)_(\d+)_(\d+)", data)
+    if m and int(m.group(1)) < len(COS_MOVE_STATUSES):
+        text, markup = cos_open_block(items, int(m.group(2)), int(m.group(3)), "m", int(m.group(1)))
         await query.edit_message_text(text, reply_markup=markup)
         return
     m = re.fullmatch(r"cos_pf_([os])_(\d)", data)
@@ -4944,7 +4995,7 @@ async def cos_open_callback(query, user_id, owner, data, items):
         render = render_cos_open if m.group(1) == "o" else render_cos_stock
         await send_long(message, render(items, now_for(owner).date(), place))
         return
-    m = re.fullmatch(r"cos_m([ip])_(\d+)(?:_(\d))?", data)
+    m = re.fullmatch(r"cos_m([ipt])_(\d+)(?:_(\d))?", data)
     if m:
         item = next((it for it in items if it["row"] == int(m.group(2))), None)
         if not item:
@@ -4952,10 +5003,20 @@ async def cos_open_callback(query, user_id, owner, data, items):
             return
         await query.edit_message_reply_markup(None)
         if m.group(1) == "i":
-            now = f" Сейчас: {item['place']}." if item.get("place") else ""
-            await message.reply_text(f"{_cos_title(item)}.{now} Куда переложить?", reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"{COS_PLACE_ICON[p]} {p}", callback_data=f"cos_mp_{item['row']}_{k}")
-                for k, p in enumerate(COS_PLACES)]]))
+            now = f" Сейчас: {item['status']}" + (f", {item['place']}" if item.get("place") else "") + "."
+            rows = [[InlineKeyboardButton(f"{COS_PLACE_ICON[p]} {p}", callback_data=f"cos_mp_{item['row']}_{k}")
+                     for k, p in enumerate(COS_PLACES)]]
+            statuses = [InlineKeyboardButton(label, callback_data=f"cos_mt_{item['row']}_{si}")
+                        for si, (status, label) in enumerate(COS_MOVE_STATUSES) if status != item["status"]]
+            rows += [statuses[i:i + 2] for i in range(0, len(statuses), 2)]
+            await message.reply_text(f"{_cos_title(item)}.{now} Куда переложить?", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if m.group(1) == "t":
+            si = int(m.group(3) or 0)
+            if si >= len(COS_MOVE_STATUSES):
+                return
+            reply, buttons = await write_to_sheet(message, cos_move_status, item, COS_MOVE_STATUSES[si][0], today_str)
+            await message.reply_text(reply, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
             return
         k = int(m.group(3) or 0)
         if k >= len(COS_PLACES):
