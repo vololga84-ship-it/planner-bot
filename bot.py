@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = ("Косметика: новая кнопка «🛠 Проверить даты» — бот показывает по одному средству (сначала просроченные, потом открытые без даты вскрытия) с датой покупки и кнопками: исправить срок, указать, когда открыто, подарила, выбросила.")
+LATEST_CHANGE_NOTE = ("Косметика: кнопка «🆕 Открыть из запаса» — выбираешь раздел и баночку из списка, без названий; и «🛠 Проверить даты» — карточки по одному средству с датой покупки.")
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
@@ -3608,9 +3608,9 @@ COS_BRANDS_HINT = ("Anua, Round Lab, COSRX, Beauty of Joseon, Torriden, Skin1004
 
 COSMETICS_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("🧴 Открыто"), KeyboardButton("📦 Запас")],
+     [KeyboardButton("🆕 Открыть из запаса"), KeyboardButton("🛠 Проверить даты")],
      [KeyboardButton("⏰ Сроки"), KeyboardButton("⚖️ Сравнить цены")],
-     [KeyboardButton("🛠 Проверить даты"), KeyboardButton("💬 Реакция")],
-     [KeyboardButton("⬅️ Выйти")]],
+     [KeyboardButton("💬 Реакция"), KeyboardButton("⬅️ Выйти")]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -4268,6 +4268,7 @@ async def enter_cosmetics_mode(update, owner):
             "• «цена крема Round Lab примерно 1400 по аналогу»\n"
             "• «подарила маме маску Abib»\n"
             "Или пришли фото баночки — узнаю её сама (подпись к фото тоже понимаю: «открыла»).\n"
+            "• кнопка «🆕 Открыть из запаса» — выбрать баночку из списка, без названий\n"
             "Кнопки внизу — списки. Чтобы выйти, нажми «⬅️ Выйти».")
     await update.message.reply_text(text, reply_markup=COSMETICS_KEYBOARD)
     try:
@@ -4305,6 +4306,10 @@ async def cosmetics_text(update, text, owner):
     if _cos_button(text, "Сравнить цены"):
         items = await write_to_sheet(message, load_cosmetics)
         await send_long(message, render_cos_compare(items))
+        return
+    if _cos_button(text, "Открыть из запаса"):
+        items = await write_to_sheet(message, load_cosmetics)
+        await message.reply_text(*cos_open_menu(items))
         return
     if _cos_button(text, "Проверить даты"):
         pending_cos_date.pop(user_id, None)
@@ -4616,6 +4621,9 @@ async def cosmetics_callback(query, user_id, owner, data):
     if data.startswith("cos_rv_"):
         await cos_review_callback(query, user_id, owner, data, items)
         return
+    if re.match(r"cos_o[bid]_", data):
+        await cos_open_callback(query, user_id, owner, data, items)
+        return
 
     m = re.fullmatch(r"cos_pick(\d+)_(\d+)", data)
     pick_id = int(m.group(1)) if m else None
@@ -4709,6 +4717,11 @@ def cos_review_set(item, field, value, note=None):
     save_cosmetic(item)
     return item
 
+def _cos_pao_governs(it):
+    """Срок вышел из-за вскрытия (дата вскрытия + срок после вскрытия), а не из-за упаковки."""
+    until, expiry = _cos_date(it.get("use_until")), _cos_date(it.get("expiry"))
+    return bool(until and it.get("opened") and _cos_num(it.get("pao")) and (not expiry or until < expiry))
+
 def _cos_until_reason(it):
     """Какая из двух дат главнее: срок с упаковки или дата вскрытия + срок после вскрытия."""
     until, expiry = _cos_date(it.get("use_until")), _cos_date(it.get("expiry"))
@@ -4722,7 +4735,9 @@ def _cos_until_reason(it):
     return " (по сроку с упаковки)"
 
 def cos_review_card(cat, it, today, total):
-    head = {"A": _cos_left(it.get("use_until") or it.get("expiry"), today) + ". Даты верные?",
+    head = {"A": (_cos_left(it.get("use_until") or it.get("expiry"), today) + ". После вскрытия прошло больше, чем указано ("
+                  + f"{it['opened']} + {it['pao']} мес). Что с ней?" if _cos_pao_governs(it)
+                  else _cos_left(it.get("use_until") or it.get("expiry"), today) + ". Даты верные?"),
             "B": "📅 Открыто, но нет даты вскрытия. Когда открыла?",
             "C": "❓ Не указан срок годности."}[cat]
     comment = it.get("comment") or ""
@@ -4746,9 +4761,13 @@ def cos_review_keyboard(cat, it):
     row, buttons = it["row"], []
     b = lambda text, data: InlineKeyboardButton(text, callback_data=data)
     first = []
-    if cat == "A":
-        first.append(b("✅ Дата верна", f"cos_rv_ok_{row}"))
-    first.append(b("✏️ Годен до", f"cos_rv_exp_{row}"))
+    if cat == "A" and _cos_pao_governs(it):
+        # срок посчитан от вскрытия — переспрашивать «годен до» незачем
+        first = [b("✅ Ещё пользуюсь", f"cos_rv_ok_{row}"), b("✏️ Дата вскрытия", f"cos_rv_opd_{row}")]
+    else:
+        if cat == "A":
+            first.append(b("✅ Дата верна", f"cos_rv_ok_{row}"))
+        first.append(b("✏️ Годен до", f"cos_rv_exp_{row}"))
     buttons.append(first)
     if it["status"] == COS_OPEN and not it.get("opened"):
         ago = [b(f"📅 {t}", f"cos_rv_op_{row}_{d}") for t, d in COS_REVIEW_OPEN_AGO]
@@ -4790,7 +4809,7 @@ async def cos_review_callback(query, user_id, owner, data, items):
         cos_review_skipped.setdefault(user_id, set()).add(row)
     elif kind == "ok":
         _cos_review_ok_add(_cos_review_key(item))
-        prefix = f"✅ Дата верна: {item['name']}."
+        prefix = f"✅ Отметила, больше не спрашиваю: {item['name']}."
     elif kind in ("exp", "opd"):
         pending_cos_date[user_id] = (time.monotonic(), row, "expiry" if kind == "exp" else "opened")
         what = "«годен до»" if kind == "exp" else "дату вскрытия"
@@ -4810,6 +4829,88 @@ async def cos_review_callback(query, user_id, owner, data, items):
     items = await write_to_sheet(message, load_cosmetics)
     await cos_review_show(message, user_id, items, today, prefix)
 
+
+# ── Открыть из запаса: выбор баночки кнопками, без названий ────────
+COS_OPEN_PAGE = 10
+COS_OPEN_AGO = [("вчера", 1), ("3 дня назад", 3), ("неделю назад", 7), ("2 недели", 14)]
+
+def _cos_block_of(it):
+    return it.get("block") if it.get("block") in COS_BLOCKS else "Без блока"
+
+def cos_open_menu(items):
+    """(текст, кнопки): разделы с числом средств в запасе."""
+    stock = [it for it in items if it["status"] == COS_STOCK]
+    names = COS_BLOCKS + ["Без блока"]
+    buttons = []
+    for i, name in enumerate(names):
+        n = sum(1 for it in stock if _cos_block_of(it) == name)
+        if n:
+            buttons.append(InlineKeyboardButton(f"{name} ({n})", callback_data=f"cos_ob_{i}_0"))
+    if not buttons:
+        return "В запасе ничего нет.", None
+    return "Из какого раздела открыла?", InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+
+def cos_open_block(items, block_index, page):
+    names = COS_BLOCKS + ["Без блока"]
+    if not 0 <= block_index < len(names):
+        return cos_open_menu(items)
+    name = names[block_index]
+    far = datetime.max.date()
+    group = sorted((it for it in items if it["status"] == COS_STOCK and _cos_block_of(it) == name),
+                   key=lambda it: (_cos_date(it.get("expiry")) or far, it["name"]))
+    pages = max(1, -(-len(group) // COS_OPEN_PAGE))
+    page = min(max(page, 0), pages - 1)
+    buttons = [[InlineKeyboardButton(_cos_title(it)[:45], callback_data=f"cos_oi_{it['row']}")]
+               for it in group[page * COS_OPEN_PAGE:(page + 1) * COS_OPEN_PAGE]]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"cos_ob_{block_index}_{page - 1}"))
+    nav.append(InlineKeyboardButton("↩️ Разделы", callback_data="cos_ob_menu"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"cos_ob_{block_index}_{page + 1}"))
+    buttons.append(nav)
+    return f"{name} — что открыла? (сначала те, у кого срок раньше) стр. {page + 1}/{pages}", InlineKeyboardMarkup(buttons)
+
+@_cos_safe
+async def cos_open_callback(query, user_id, owner, data, items):
+    message, today_str = query.message, today_for(owner)
+    if data == "cos_ob_menu":
+        text, markup = cos_open_menu(items)
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+    m = re.fullmatch(r"cos_ob_(\d+)_(\d+)", data)
+    if m:
+        text, markup = cos_open_block(items, int(m.group(1)), int(m.group(2)))
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+    m = re.fullmatch(r"cos_o([id])_(\d+)(?:_(\d+))?", data)
+    if not m:
+        return
+    kind, row = m.group(1), int(m.group(2))
+    item = next((it for it in items if it["row"] == row), None)
+    if not item:
+        await message.reply_text("🤔 Не нашла это средство в таблице — может, строку удалили.")
+        return
+    cos_set_last(user_id, row=row)
+    if kind == "i":
+        if item["status"] != COS_STOCK:
+            await query.edit_message_reply_markup(None)
+            await message.reply_text(f"{_cos_title(item)} уже не в запасе ({item['status']}).")
+            return
+        await query.edit_message_reply_markup(None)
+        reply, buttons = await write_to_sheet(message, apply_cosmetic, item, {"action": "open"}, today_str)
+        buttons = (buttons or []) + [[InlineKeyboardButton(f"открыла {t}", callback_data=f"cos_od_{row}_{d}")
+                                      for t, d in COS_OPEN_AGO[:2]],
+                                     [InlineKeyboardButton(f"открыла {t}", callback_data=f"cos_od_{row}_{d}")
+                                      for t, d in COS_OPEN_AGO[2:]]]
+        await message.reply_text(reply + "\nОткрыла не сегодня? Нажми, когда:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    days = int(m.group(3) or 0)
+    day = (_cos_date(today_str) - timedelta(days=days)).strftime("%d.%m.%Y")
+    await query.edit_message_reply_markup(None)
+    saved = await write_to_sheet(message, cos_review_set, item, "opened", day)
+    until = f" Пользоваться до {saved['use_until']}." if saved.get("use_until") else ""
+    await message.reply_text(f"📅 {saved['name']}: открыто {day}.{until}")
 
 async def run_cosmetics_reminder(context: ContextTypes.DEFAULT_TYPE):
     """Раз в неделю, в понедельник утром: что пора выбросить или скоро истекает."""
