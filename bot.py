@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = ("Косметика: починила кнопку «🆕 Открыть из запаса» — раньше список не открывался.")
+LATEST_CHANGE_NOTE = ("Косметика: у каждого средства теперь есть место (ванная / комната / гардероб). Кнопка «📍 Переместить», под списками «Запас» и «Открыто» — фильтр по месту. Режим «Косметика» больше не сбрасывается при обновлении бота.")
 
 # Кому уходит LATEST_CHANGE_NOTE: None — всем участникам; {"Оля"} — только ей
 # (правка в блоке, который видит только она, например «Косметика»: маме и
@@ -1790,6 +1790,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     general_notes_mode_users.discard(user_id)
     bot_idea_mode_users.discard(user_id)
     cosmetics_mode_users.discard(user_id)
+    cos_mode_save()
     pending_cos_pick.pop(user_id, None)
     pending_cos_photo.pop(user_id, None)
     pending_cos_comment.pop(user_id, None)
@@ -3596,13 +3597,15 @@ COSMETICS_OWNERS = set(o.strip() for o in os.getenv("COSMETICS_OWNERS", "Оля"
 COSMETICS_SHEET = "🧴 Косметика"
 COS_FIELDS = ["block", "name", "format", "volume", "unit", "price", "price_kind", "site_price", "box", "per_unit",
               "status", "expiry", "opened", "pao", "use_until", "finished", "lasted",
-              "reaction", "comment", "bought"]
+              "reaction", "comment", "bought", "place"]
 COS_HEADER = ["Блок", "Название", "Формат", "Объём", "Ед.", "Цена, ₽", "Цена точная / по аналогу / из бокса", "Цена на сайте, ₩", "Бокс",
               "₽ за 100 мл/г (или за 1 шт)", "Статус", "Годен до", "Открыто",
               "Срок после вскрытия, мес", "Использовать до", "Закончилось", "Хватило, дней",
-              "Реакция", "Комментарий", "Куплено / получено"]
+              "Реакция", "Комментарий", "Куплено / получено", "Где лежит"]
 COS_BLOCKS = ["Очищение", "Тонеры и эссенции", "Сыворотки и ампулы", "Кремы", "Вокруг глаз", "SPF",
               "Маски и пады", "Тело", "Волосы", "Макияж", "Пробники"]
+COS_PLACES = ["ванная", "комната", "гардероб"]
+COS_PLACE_ICON = {"ванная": "🛁", "комната": "🛏", "гардероб": "👗"}
 COS_STOCK, COS_OPEN, COS_DONE, COS_TRASH, COS_GIFT = "в запасе", "открыто", "закончилось", "выбросила", "подарила"
 COS_ACTIONS = ("add", "open", "finish", "discard", "gift", "reaction", "update")
 COS_REACTIONS = {"love": "💚 Люблю", "ok": "👍 Норм", "no": "👎 Не моё", "skin": "⚠️ Реакция кожи"}
@@ -3615,14 +3618,33 @@ COS_BRANDS_HINT = ("Anua, Round Lab, COSRX, Beauty of Joseon, Torriden, Skin1004
 
 COSMETICS_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("🧴 Открыто"), KeyboardButton("📦 Запас")],
-     [KeyboardButton("🆕 Открыть из запаса"), KeyboardButton("🛠 Проверить даты")],
-     [KeyboardButton("⏰ Сроки"), KeyboardButton("⚖️ Сравнить цены")],
-     [KeyboardButton("💬 Реакция"), KeyboardButton("⬅️ Выйти")]],
+     [KeyboardButton("🆕 Открыть из запаса"), KeyboardButton("📍 Переместить")],
+     [KeyboardButton("🛠 Проверить даты"), KeyboardButton("⏰ Сроки")],
+     [KeyboardButton("⚖️ Сравнить цены"), KeyboardButton("💬 Реакция")],
+     [KeyboardButton("⬅️ Выйти")]],
     resize_keyboard=True,
     is_persistent=True,
 )
 
-cosmetics_mode_users = set()
+COS_MODE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cos_mode_users.json")
+
+def _cos_mode_load():
+    try:
+        with open(COS_MODE_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+def cos_mode_save():
+    """Режим «Косметика» переживает перезапуск бота: иначе после обновления
+    сообщение уходило бы в задачи, как случилось 18.10.2026."""
+    try:
+        with open(COS_MODE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(cosmetics_mode_users), f)
+    except OSError:
+        logger.exception("Косметика: не удалось запомнить режим")
+
+cosmetics_mode_users = _cos_mode_load()
 pending_cos_pick    = {}  # user_id -> {номер вопроса: разобранная фраза}, ждём выбор средства кнопкой
 _cos_pick_counter   = [0]
 pending_cos_photo   = {}  # user_id -> список средств с фото, ждём «в запас»/«открыла»
@@ -4066,7 +4088,11 @@ def apply_cosmetic(item, parsed, today_str, new=False, hint=True):
         item["status"] = COS_STOCK
         if new and not item.get("bought"):
             item["bought"] = f"{day} покупка"
+        if new and not item.get("place"):
+            item["place"] = "комната"
     elif action == "open":
+        if item.get("status") == COS_STOCK and not parsed.get("keep_place"):
+            item["place"] = "ванная"   # открытое — то, чем пользуется, лежит в ванной
         item["status"], item["opened"], item["finished"] = COS_OPEN, day, ""
     elif action == "finish":
         item["status"], item["finished"] = COS_DONE, day
@@ -4143,33 +4169,36 @@ def _cos_by_block(items):
     order = COS_BLOCKS + ["Без блока"]
     return sorted(groups.items(), key=lambda g: order.index(g[0]) if g[0] in order else len(order))
 
-def render_cos_open(items, today):
-    opened = [it for it in items if it["status"] == COS_OPEN]
+def render_cos_open(items, today, place=None):
+    opened = [it for it in items if it["status"] == COS_OPEN and (not place or it.get("place") == place)]
     if not opened:
-        return "🧴 Открытого сейчас ничего нет."
+        return f"🧴 Открытого сейчас ничего нет{' (' + place + ')' if place else ''}."
     far = datetime.max.date()
-    lines = [f"🧴 Открыто сейчас ({len(opened)}):"]
+    lines = [f"🧴 Открыто сейчас{' — ' + place if place else ''} ({len(opened)}):"]
     for block, group in _cos_by_block(opened):
         lines.append(f"\n{block}")
         for it in sorted(group, key=lambda i: _cos_date(i["use_until"]) or far):
             mark = (it.get("reaction") or "")[:1]
             when = (f"до {it['use_until']}, {_cos_left(it['use_until'], today)}" if it.get("use_until")
                     else "срок после вскрытия не указан")
-            lines.append(f"• {mark + ' ' if mark else ''}{_cos_title(it)} — открыто {it['opened'] or '?'}, {when}")
+            lines.append(f"• {_cos_place_tag(it)}{mark + ' ' if mark else ''}{_cos_title(it)} — открыто {it['opened'] or '?'}, {when}")
     return "\n".join(lines)
 
-def render_cos_stock(items, today):
-    stock = [it for it in items if it["status"] == COS_STOCK]
+def _cos_place_tag(it):
+    return COS_PLACE_ICON.get(it.get("place"), "") + " " if it.get("place") else ""
+
+def render_cos_stock(items, today, place=None):
+    stock = [it for it in items if it["status"] == COS_STOCK and (not place or it.get("place") == place)]
     if not stock:
-        return "📦 В запасе пусто."
+        return f"📦 В запасе пусто{' (' + place + ')' if place else ''}."
     far = datetime.max.date()
-    lines = [f"📦 В запасе ({len(stock)}). Сверху — что истекает раньше, его и открывать первым:"]
+    lines = [f"📦 В запасе{' — ' + place if place else ''} ({len(stock)}). Сверху — что истекает раньше, его и открывать первым:"]
     for block, group in _cos_by_block(stock):
         lines.append(f"\n{block}")
         for it in sorted(group, key=lambda i: _cos_date(i["expiry"]) or far):
             when = (f"годен до {it['expiry']} ({_cos_left(it['expiry'], today)})" if it.get("expiry")
                     else "❔ срок годности не указан")
-            lines.append(f"• {_cos_title(it)} — {when}")
+            lines.append(f"• {_cos_place_tag(it)}{_cos_title(it)} — {when}")
     return "\n".join(lines)
 
 def render_cos_deadlines(items, today):
@@ -4267,6 +4296,7 @@ def _cos_safe(handler):
 async def enter_cosmetics_mode(update, owner):
     user_id = str(update.effective_user.id)
     cosmetics_mode_users.add(user_id)
+    cos_mode_save()
     text = ("🧴 Режим «Косметика». Говори или пиши:\n"
             "• «купила крем Round Lab 80 мл за 1500, годен до 03.2028»\n"
             "• «открыла тонер Anua, 12 месяцев»\n"
@@ -4276,6 +4306,7 @@ async def enter_cosmetics_mode(update, owner):
             "• «подарила маме маску Abib»\n"
             "Или пришли фото баночки — узнаю её сама (подпись к фото тоже понимаю: «открыла»).\n"
             "• кнопка «🆕 Открыть из запаса» — выбрать баночку из списка, без названий\n"
+            "• кнопка «📍 Переместить» — ванная / комната / гардероб\n"
             "Кнопки внизу — списки. Чтобы выйти, нажми «⬅️ Выйти».")
     await update.message.reply_text(text, reply_markup=COSMETICS_KEYBOARD)
     try:
@@ -4296,14 +4327,15 @@ async def cosmetics_text(update, text, owner):
 
     if "Выйти" in text and len(text) <= 12:
         cosmetics_mode_users.discard(user_id)
+        cos_mode_save()
         pending_cos_comment.pop(user_id, None)
         await message.reply_text("Вышли из режима «Косметика».", reply_markup=main_keyboard_for(owner))
         return
-    views = {"Открыто": render_cos_open, "Запас": render_cos_stock}
-    for word, render in views.items():
+    views = {"Открыто": (render_cos_open, "o", COS_OPEN), "Запас": (render_cos_stock, "s", COS_STOCK)}
+    for word, (render, code, status) in views.items():
         if _cos_button(text, word):
             items = await write_to_sheet(message, load_cosmetics)
-            await send_long(message, render(items, today))
+            await send_long(message, render(items, today), cos_place_filter(items, code, status))
             return
     if _cos_button(text, "Сроки"):
         items = await write_to_sheet(message, load_cosmetics)
@@ -4313,6 +4345,11 @@ async def cosmetics_text(update, text, owner):
     if _cos_button(text, "Сравнить цены"):
         items = await write_to_sheet(message, load_cosmetics)
         await send_long(message, render_cos_compare(items))
+        return
+    if _cos_button(text, "Переместить"):
+        items = await write_to_sheet(message, load_cosmetics)
+        text_menu, markup_menu = cos_open_menu(items, "m")
+        await message.reply_text(text_menu, reply_markup=markup_menu)
         return
     if _cos_button(text, "Открыть из запаса"):
         items = await write_to_sheet(message, load_cosmetics)
@@ -4629,7 +4666,7 @@ async def cosmetics_callback(query, user_id, owner, data):
     if data.startswith("cos_rv_"):
         await cos_review_callback(query, user_id, owner, data, items)
         return
-    if re.match(r"cos_o[bid]_", data):
+    if re.match(r"cos_(o[bid]|m[bip]|pf)_", data):
         await cos_open_callback(query, user_id, owner, data, items)
         return
 
@@ -4845,51 +4882,86 @@ COS_OPEN_AGO = [("вчера", 1), ("3 дня назад", 3), ("неделю н
 def _cos_block_of(it):
     return it.get("block") if it.get("block") in COS_BLOCKS else "Без блока"
 
-def cos_open_menu(items):
-    """(текст, кнопки): разделы с числом средств в запасе."""
-    stock = [it for it in items if it["status"] == COS_STOCK]
+def cos_place_filter(items, code, status):
+    """Кнопки под списком: показать только одно место."""
+    counts = {p: sum(1 for it in items if it["status"] == status and it.get("place") == p) for p in COS_PLACES}
+    buttons = [InlineKeyboardButton(f"{COS_PLACE_ICON[p]} {p} ({n})", callback_data=f"cos_pf_{code}_{k}")
+               for k, p in enumerate(COS_PLACES) if (n := counts[p])]
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
+def cos_open_menu(items, mode="o"):
+    """(текст, кнопки): разделы с числом средств; mode o — запас (открыть), m — запас и открытое (переместить)."""
+    stock = [it for it in items if it["status"] in ((COS_STOCK,) if mode == "o" else (COS_STOCK, COS_OPEN))]
     names = COS_BLOCKS + ["Без блока"]
     buttons = []
     for i, name in enumerate(names):
         n = sum(1 for it in stock if _cos_block_of(it) == name)
         if n:
-            buttons.append(InlineKeyboardButton(f"{name} ({n})", callback_data=f"cos_ob_{i}_0"))
+            buttons.append(InlineKeyboardButton(f"{name} ({n})", callback_data=f"cos_{mode}b_{i}_0"))
     if not buttons:
-        return "В запасе ничего нет.", None
-    return "Из какого раздела открыла?", InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+        return "Пока ничего нет.", None
+    return ("Из какого раздела открыла?" if mode == "o" else "Что переложить? Выбери раздел:"), InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
 
-def cos_open_block(items, block_index, page):
+def cos_open_block(items, block_index, page, mode="o"):
     names = COS_BLOCKS + ["Без блока"]
     if not 0 <= block_index < len(names):
-        return cos_open_menu(items)
+        return cos_open_menu(items, mode)
+    statuses = (COS_STOCK,) if mode == "o" else (COS_STOCK, COS_OPEN)
     name = names[block_index]
     far = datetime.max.date()
-    group = sorted((it for it in items if it["status"] == COS_STOCK and _cos_block_of(it) == name),
+    group = sorted((it for it in items if it["status"] in statuses and _cos_block_of(it) == name),
                    key=lambda it: (_cos_date(it.get("expiry")) or far, it["name"]))
     pages = max(1, -(-len(group) // COS_OPEN_PAGE))
     page = min(max(page, 0), pages - 1)
-    buttons = [[InlineKeyboardButton(_cos_title(it)[:45], callback_data=f"cos_oi_{it['row']}")]
+    buttons = [[InlineKeyboardButton((_cos_place_tag(it) + _cos_title(it))[:45], callback_data=f"cos_{mode}i_{it['row']}")]
                for it in group[page * COS_OPEN_PAGE:(page + 1) * COS_OPEN_PAGE]]
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"cos_ob_{block_index}_{page - 1}"))
-    nav.append(InlineKeyboardButton("↩️ Разделы", callback_data="cos_ob_menu"))
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"cos_{mode}b_{block_index}_{page - 1}"))
+    nav.append(InlineKeyboardButton("↩️ Разделы", callback_data=f"cos_{mode}b_menu"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"cos_ob_{block_index}_{page + 1}"))
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"cos_{mode}b_{block_index}_{page + 1}"))
     buttons.append(nav)
-    return f"{name} — что открыла? (сначала те, у кого срок раньше) стр. {page + 1}/{pages}", InlineKeyboardMarkup(buttons)
+    ask = "что открыла? (сначала те, у кого срок раньше)" if mode == "o" else "что переложить?"
+    return f"{name} — {ask} стр. {page + 1}/{pages}", InlineKeyboardMarkup(buttons)
 
 @_cos_safe
 async def cos_open_callback(query, user_id, owner, data, items):
     message, today_str = query.message, today_for(owner)
-    if data == "cos_ob_menu":
-        text, markup = cos_open_menu(items)
+    m = re.fullmatch(r"cos_([om])b_menu", data)
+    if m:
+        text, markup = cos_open_menu(items, m.group(1))
         await query.edit_message_text(text, reply_markup=markup)
         return
-    m = re.fullmatch(r"cos_ob_(\d+)_(\d+)", data)
+    m = re.fullmatch(r"cos_([om])b_(\d+)_(\d+)", data)
     if m:
-        text, markup = cos_open_block(items, int(m.group(1)), int(m.group(2)))
+        text, markup = cos_open_block(items, int(m.group(2)), int(m.group(3)), m.group(1))
         await query.edit_message_text(text, reply_markup=markup)
+        return
+    m = re.fullmatch(r"cos_pf_([os])_(\d)", data)
+    if m and int(m.group(2)) < len(COS_PLACES):
+        place = COS_PLACES[int(m.group(2))]
+        render = render_cos_open if m.group(1) == "o" else render_cos_stock
+        await send_long(message, render(items, now_for(owner).date(), place))
+        return
+    m = re.fullmatch(r"cos_m([ip])_(\d+)(?:_(\d))?", data)
+    if m:
+        item = next((it for it in items if it["row"] == int(m.group(2))), None)
+        if not item:
+            await message.reply_text("🤔 Не нашла это средство в таблице — может, строку удалили.")
+            return
+        await query.edit_message_reply_markup(None)
+        if m.group(1) == "i":
+            now = f" Сейчас: {item['place']}." if item.get("place") else ""
+            await message.reply_text(f"{_cos_title(item)}.{now} Куда переложить?", reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"{COS_PLACE_ICON[p]} {p}", callback_data=f"cos_mp_{item['row']}_{k}")
+                for k, p in enumerate(COS_PLACES)]]))
+            return
+        k = int(m.group(3) or 0)
+        if k >= len(COS_PLACES):
+            return
+        await write_to_sheet(message, cos_review_set, item, "place", COS_PLACES[k])
+        await message.reply_text(f"{COS_PLACE_ICON[COS_PLACES[k]]} {item['name']}: теперь «{COS_PLACES[k]}».")
         return
     m = re.fullmatch(r"cos_o([id])_(\d+)(?:_(\d+))?", data)
     if not m:

@@ -14,3 +14,4 @@ bot_local.log
 
 # Отметки проверки дат косметики (локально)
 cos_review_ok.json
+.cos_mode_users.json
