@@ -4711,10 +4711,19 @@ def cos_review_card(cat, it, today, total):
     head = {"A": _cos_left(it.get("use_until") or it.get("expiry"), today) + ". Даты верные?",
             "B": "📅 Открыто, но нет даты вскрытия. Когда открыла?",
             "C": "❓ Не указан срок годности."}[cat]
-    lines = [f"🛠 {_cos_title(it)}", f"Статус: {it['status']}",
-             f"Годен до: {it.get('expiry') or '—'}",
-             f"Открыто: {it.get('opened') or '—'}" + (f", после вскрытия {it['pao']} мес" if it.get("pao") else ""),
-             f"Использовать до: {it.get('use_until') or '—'}", "", head, f"(в очереди ещё {total - 1})"]
+    comment = it.get("comment") or ""
+    source = re.search(r"цена:\s*([^;\n]+)", comment)
+    made = re.search(r"изготовлено (\d{2}\.\d{2}\.\d{4})", comment)
+    lines = [f"🛠 {_cos_title(it)}", f"Статус: {it['status']}"]
+    if source:
+        lines.append(f"💰 Откуда цена: {source.group(1).strip()[:140]}")
+    if it.get("box"):
+        lines.append(f"📦 Бокс: {it['box']}")
+    if made:
+        lines.append(f"🏭 Изготовлено: {made.group(1)}")
+    lines += [f"Годен до: {it.get('expiry') or '—'}",
+              f"Открыто: {it.get('opened') or '—'}" + (f", после вскрытия {it['pao']} мес" if it.get("pao") else ""),
+              f"Использовать до: {it.get('use_until') or '—'}", "", head, f"(в очереди ещё {total - 1})"]
     return "\n".join(lines)
 
 def cos_review_keyboard(cat, it):
