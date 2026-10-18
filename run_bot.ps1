@@ -40,7 +40,26 @@ function Wait-Vpn {
 while ($true) {
   if (-not (Wait-Vpn)) { Say "VPN не поднялся за 20 минут, пробую ещё раз"; continue }
   Say "VPN на месте, стартую бота"
+  # Следим за кодом: изменили bot.py (выложили новую версию) — перезапускаем
+  # бота сами. Ждём 20 секунд, чтобы файл дописался, и гасим процесс бота
+  # вместе с дочерним: цикл ниже поднимет его заново.
+  $watch = Start-Job -ArgumentList $dir, $PID -ScriptBlock {
+    param($d, $sup)
+    $files = 'bot.py', 'run_local.py', 'mail_digest.py' | ForEach-Object { Join-Path $d $_ }
+    function Stamp { ($files | ForEach-Object { (Get-Item $_ -ErrorAction SilentlyContinue).LastWriteTimeUtc.Ticks }) -join ',' }
+    $was = Stamp
+    while ($true) {
+      Start-Sleep -Seconds 15
+      if ((Stamp) -ne $was) {
+        Start-Sleep -Seconds 20
+        Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.ParentProcessId -eq $sup } |
+          ForEach-Object { & taskkill /PID $_.ProcessId /T /F | Out-Null }
+        return
+      }
+    }
+  }
   & $py 'run_local.py' *>> $log
+  Stop-Job $watch -ErrorAction SilentlyContinue; Remove-Job $watch -Force -ErrorAction SilentlyContinue
   Say "бот остановился (код $LASTEXITCODE), перезапуск через 20 секунд"
   Start-Sleep -Seconds 20
 }
