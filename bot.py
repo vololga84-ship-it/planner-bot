@@ -3589,11 +3589,11 @@ COSMETICS_OWNERS = set(o.strip() for o in os.getenv("COSMETICS_OWNERS", "Оля"
 COSMETICS_SHEET = "🧴 Косметика"
 COS_FIELDS = ["block", "name", "format", "volume", "unit", "price", "price_kind", "site_price", "box", "per_unit",
               "status", "expiry", "opened", "pao", "use_until", "finished", "lasted",
-              "reaction", "comment"]
+              "reaction", "comment", "bought"]
 COS_HEADER = ["Блок", "Название", "Формат", "Объём", "Ед.", "Цена, ₽", "Цена точная / по аналогу / из бокса", "Цена на сайте, ₩", "Бокс",
               "₽ за 100 мл/г (или за 1 шт)", "Статус", "Годен до", "Открыто",
               "Срок после вскрытия, мес", "Использовать до", "Закончилось", "Хватило, дней",
-              "Реакция", "Комментарий"]
+              "Реакция", "Комментарий", "Куплено / получено"]
 COS_BLOCKS = ["Очищение", "Тонеры и эссенции", "Сыворотки и ампулы", "Кремы", "Вокруг глаз", "SPF",
               "Маски и пады", "Тело", "Волосы", "Макияж", "Пробники"]
 COS_STOCK, COS_OPEN, COS_DONE, COS_TRASH, COS_GIFT = "в запасе", "открыто", "закончилось", "выбросила", "подарила"
@@ -4057,6 +4057,8 @@ def apply_cosmetic(item, parsed, today_str, new=False, hint=True):
     buttons = []
     if action == "add":
         item["status"] = COS_STOCK
+        if new and not item.get("bought"):
+            item["bought"] = f"{day} покупка"
     elif action == "open":
         item["status"], item["opened"], item["finished"] = COS_OPEN, day, ""
     elif action == "finish":
@@ -4715,6 +4717,8 @@ def cos_review_card(cat, it, today, total):
     source = re.search(r"цена:\s*([^;\n]+)", comment)
     made = re.search(r"изготовлено (\d{2}\.\d{2}\.\d{4})", comment)
     lines = [f"🛠 {_cos_title(it)}", f"Статус: {it['status']}"]
+    if it.get("bought"):
+        lines.append(f"🛒 Куплено / получено: {it['bought']}")
     if source:
         lines.append(f"💰 Откуда цена: {source.group(1).strip()[:140]}")
     if it.get("box"):
