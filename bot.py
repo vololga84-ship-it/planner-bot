@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 # не только при чисто технических правках.
 LATEST_CHANGE_NOTE = ("Косметика: кнопка «🆕 Открыть из запаса» — выбираешь раздел и баночку из списка, без названий; и «🛠 Проверить даты» — карточки по одному средству с датой покупки.")
 
+# Кому уходит LATEST_CHANGE_NOTE: None — всем участникам; {"Оля"} — только ей
+# (правка в блоке, который видит только она, например «Косметика»: маме и
+# Юле перезапускать бота незачем).
+LATEST_CHANGE_AUDIENCE = {"Оля"}
+
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
 SPREADSHEET_ID  = os.getenv("SPREADSHEET_ID")
@@ -3571,6 +3576,8 @@ async def notify_users_about_restart(app):
     except OSError:
         logger.exception("Не удалось запомнить отправленную новость")
     for telegram_id in USER_NAMES:
+        if LATEST_CHANGE_AUDIENCE and USER_NAMES[telegram_id] not in LATEST_CHANGE_AUDIENCE:
+            continue
         try:
             await app.bot.send_message(
                 chat_id=int(telegram_id),
