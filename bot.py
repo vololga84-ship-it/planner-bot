@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # (notify_users_about_restart). ОБНОВЛЯЙ этой строкой при каждом деплое,
 # который пользователь должен заметить (новая кнопка, починенный баг),
 # не только при чисто технических правках.
-LATEST_CHANGE_NOTE = ("Косметика: кнопка «🆕 Открыть из запаса» — выбираешь раздел и баночку из списка, без названий; и «🛠 Проверить даты» — карточки по одному средству с датой покупки.")
+LATEST_CHANGE_NOTE = ("Косметика: починила кнопку «🆕 Открыть из запаса» — раньше список не открывался.")
 
 # Кому уходит LATEST_CHANGE_NOTE: None — всем участникам; {"Оля"} — только ей
 # (правка в блоке, который видит только она, например «Косметика»: маме и
@@ -4316,7 +4316,8 @@ async def cosmetics_text(update, text, owner):
         return
     if _cos_button(text, "Открыть из запаса"):
         items = await write_to_sheet(message, load_cosmetics)
-        await message.reply_text(*cos_open_menu(items))
+        text_menu, markup_menu = cos_open_menu(items)
+        await message.reply_text(text_menu, reply_markup=markup_menu)
         return
     if _cos_button(text, "Проверить даты"):
         pending_cos_date.pop(user_id, None)
