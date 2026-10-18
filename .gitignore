@@ -11,3 +11,6 @@ dashboard_full.json
 .venv/
 bot_local.log
 .last_change_note
+
+# Отметки проверки дат косметики (локально)
+cos_review_ok.json

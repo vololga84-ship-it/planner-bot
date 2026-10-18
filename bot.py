@@ -1788,6 +1788,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_cos_pick.pop(user_id, None)
     pending_cos_photo.pop(user_id, None)
     pending_cos_comment.pop(user_id, None)
+    pending_cos_date.pop(user_id, None)
+    cos_review_skipped.pop(user_id, None)
     cos_last.pop(user_id, None)
     user_states.pop(user_id, None)
     pending_health.pop(user_id, None)
@@ -3607,7 +3609,8 @@ COS_BRANDS_HINT = ("Anua, Round Lab, COSRX, Beauty of Joseon, Torriden, Skin1004
 COSMETICS_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("🧴 Открыто"), KeyboardButton("📦 Запас")],
      [KeyboardButton("⏰ Сроки"), KeyboardButton("⚖️ Сравнить цены")],
-     [KeyboardButton("💬 Реакция"), KeyboardButton("⬅️ Выйти")]],
+     [KeyboardButton("🛠 Проверить даты"), KeyboardButton("💬 Реакция")],
+     [KeyboardButton("⬅️ Выйти")]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -3617,6 +3620,8 @@ pending_cos_pick    = {}  # user_id -> {номер вопроса: разобр�
 _cos_pick_counter   = [0]
 pending_cos_photo   = {}  # user_id -> список средств с фото, ждём «в запас»/«открыла»
 pending_cos_comment = {}  # user_id -> (monotonic, строка), ждём комментарий к реакции
+pending_cos_date    = {}  # user_id -> (monotonic, строка, поле): ждём дату текстом в проверке дат
+cos_review_skipped  = {}  # user_id -> строки, которые в этой проверке пропустили
 cos_last = {}             # user_id -> {"t", "row", "photo"}: о каком средстве шла речь только что
 COS_LAST_TTL = 900        # секунд: «открыла 3 недели назад» без названия — про него
 
@@ -4299,6 +4304,28 @@ async def cosmetics_text(update, text, owner):
         items = await write_to_sheet(message, load_cosmetics)
         await send_long(message, render_cos_compare(items))
         return
+    if _cos_button(text, "Проверить даты"):
+        pending_cos_date.pop(user_id, None)
+        cos_review_skipped[user_id] = set()
+        items = await write_to_sheet(message, load_cosmetics)
+        await cos_review_show(message, user_id, items, today)
+        return
+    waiting_date = pending_cos_date.pop(user_id, None)
+    if waiting_date and time.monotonic() - waiting_date[0] <= COS_COMMENT_TTL:
+        value = _cos_norm_date(text)
+        if value and not (waiting_date[2] == "opened" and _cos_date(value) > today):
+            items = await write_to_sheet(message, load_cosmetics)
+            item = next((it for it in items if it["row"] == waiting_date[1]), None)
+            if item:
+                note = None if waiting_date[2] == "expiry" else f"дата вскрытия со слов {today.strftime('%d.%m.%Y')}"
+                await write_to_sheet(message, cos_review_set, item, waiting_date[2], value, note)
+                items = await write_to_sheet(message, load_cosmetics)
+                await cos_review_show(message, user_id, items, today,
+                                      f"✅ Записала: {item['name']} — {value}.")
+                return
+            await message.reply_text("🤔 Не нашла это средство в таблице — может, строку удалили.")
+            return
+        # не дата — обычная фраза, разбираем как всегда
     if _cos_button(text, "Реакция"):
         items = await write_to_sheet(message, load_cosmetics)
         finished = sorted([it for it in items if it["status"] in (COS_DONE, COS_TRASH)],
@@ -4584,6 +4611,10 @@ async def cosmetics_callback(query, user_id, owner, data):
         await cos_report_boxes(message, {p.get("box") for p in photo_items}, today_str)
         return
 
+    if data.startswith("cos_rv_"):
+        await cos_review_callback(query, user_id, owner, data, items)
+        return
+
     m = re.fullmatch(r"cos_pick(\d+)_(\d+)", data)
     pick_id = int(m.group(1)) if m else None
     if m:
@@ -4623,6 +4654,137 @@ async def cosmetics_callback(query, user_id, owner, data):
         reply, buttons = await write_to_sheet(message, apply_cosmetic, item,
                                               {"action": "update", "pao_months": int(m.group(3))}, today_str)
         await done(reply, buttons)
+
+# ── Проверка дат: карточка на каждое средство с кнопками ───────────
+# Очередь: сначала просроченные (даты могли быть прочитаны с упаковки
+# неверно), потом открытые без даты вскрытия, потом без срока годности.
+# Всё на кнопках и без ИИ: токены на неё не тратятся.
+COS_REVIEW_OK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cos_review_ok.json")
+COS_REVIEW_OPEN_AGO = [("~неделю", 7), ("~месяц", 30), ("~3 мес", 90), ("~полгода", 180), ("~год", 365)]
+
+def _cos_review_key(it):
+    return f"{it['name']}|{it.get('expiry')}|{it.get('opened')}"
+
+def _cos_review_ok_load():
+    try:
+        with open(COS_REVIEW_OK_FILE, encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+def _cos_review_ok_add(key):
+    keys = _cos_review_ok_load() | {key}
+    try:
+        with open(COS_REVIEW_OK_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(keys), f, ensure_ascii=False)
+    except OSError:
+        logger.exception("Косметика: не удалось сохранить отметки проверки дат")
+
+def cos_review_queue(items, today, skipped=()):
+    """[(категория, средство)]: A — срок вышел, B — открыто без даты вскрытия,
+    C — нет срока годности."""
+    ok = _cos_review_ok_load()
+    queue = []
+    for it in items:
+        if it["status"] not in (COS_STOCK, COS_OPEN) or it["row"] in skipped:
+            continue
+        limit = _cos_date(it.get("use_until")) or _cos_date(it.get("expiry"))
+        if limit and limit < today:
+            if _cos_review_key(it) in ok:
+                continue
+            queue.append(("A", it))
+        elif it["status"] == COS_OPEN and not it.get("opened"):
+            queue.append(("B", it))
+        elif not limit:
+            queue.append(("C", it))
+    return sorted(queue, key=lambda q: (q[0], q[1]["row"]))
+
+def cos_review_set(item, field, value, note=None):
+    """Записывает дату в строку и пересчитывает «использовать до»."""
+    item[field] = value
+    if note and note not in (item.get("comment") or ""):
+        item["comment"] = f"{item['comment']}\n{note}".strip() if item.get("comment") else note
+    save_cosmetic(item)
+    return item
+
+def cos_review_card(cat, it, today, total):
+    head = {"A": _cos_left(it.get("use_until") or it.get("expiry"), today) + ". Даты верные?",
+            "B": "📅 Открыто, но нет даты вскрытия. Когда открыла?",
+            "C": "❓ Не указан срок годности."}[cat]
+    lines = [f"🛠 {_cos_title(it)}", f"Статус: {it['status']}",
+             f"Годен до: {it.get('expiry') or '—'}",
+             f"Открыто: {it.get('opened') or '—'}" + (f", после вскрытия {it['pao']} мес" if it.get("pao") else ""),
+             f"Использовать до: {it.get('use_until') or '—'}", "", head, f"(в очереди ещё {total - 1})"]
+    return "\n".join(lines)
+
+def cos_review_keyboard(cat, it):
+    row, buttons = it["row"], []
+    b = lambda text, data: InlineKeyboardButton(text, callback_data=data)
+    first = []
+    if cat == "A":
+        first.append(b("✅ Дата верна", f"cos_rv_ok_{row}"))
+    first.append(b("✏️ Годен до", f"cos_rv_exp_{row}"))
+    buttons.append(first)
+    if it["status"] == COS_OPEN and not it.get("opened"):
+        ago = [b(f"📅 {t}", f"cos_rv_op_{row}_{d}") for t, d in COS_REVIEW_OPEN_AGO]
+        buttons += [ago[:3], ago[3:] + [b("📅 своя дата", f"cos_rv_opd_{row}")]]
+    if it["status"] == COS_OPEN and not it.get("pao"):
+        buttons.append([b(f"{m} мес", f"cos_rv_pao_{row}_{m}") for m in (3, 6, 12, 24)])
+    status = [b("🎁 Подарила", f"cos_rv_do_gift_{row}"), b("🗑 Выбросила", f"cos_rv_do_discard_{row}")]
+    if it["status"] == COS_OPEN:
+        status.insert(0, b("✔️ Закончилось", f"cos_rv_do_finish_{row}"))
+    buttons += [status, [b("⏭ Дальше", f"cos_rv_next_{row}")]]
+    return InlineKeyboardMarkup(buttons)
+
+async def cos_review_show(message, user_id, items, today, prefix=""):
+    """Показывает следующую карточку очереди (с результатом прошлого шага сверху)."""
+    queue = cos_review_queue(items, today, cos_review_skipped.get(user_id, ()))
+    if not queue:
+        await message.reply_text((prefix + "\n\n" if prefix else "") + "🎉 Очередь проверки пуста: у всех "
+                                 "средств есть даты, а просроченное отмечено.")
+        return
+    cat, it = queue[0]
+    cos_set_last(user_id, row=it["row"])
+    await message.reply_text((prefix + "\n\n" if prefix else "") + cos_review_card(cat, it, today, len(queue)),
+                             reply_markup=cos_review_keyboard(cat, it))
+
+@_cos_safe
+async def cos_review_callback(query, user_id, owner, data, items):
+    message, today = query.message, now_for(owner).date()
+    m = re.fullmatch(r"cos_rv_(next|ok|exp|opd|op|pao|do)_(?:(finish|discard|gift)_)?(\d+)(?:_(\d+))?", data)
+    if not m:
+        return
+    kind, action, row, extra = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+    item = next((it for it in items if it["row"] == row), None)
+    await query.edit_message_reply_markup(None)
+    if not item:
+        await message.reply_text("🤔 Не нашла это средство в таблице — может, строку удалили.")
+        return
+    prefix, today_str = "", today.strftime("%d.%m.%Y")
+    if kind == "next":
+        cos_review_skipped.setdefault(user_id, set()).add(row)
+    elif kind == "ok":
+        _cos_review_ok_add(_cos_review_key(item))
+        prefix = f"✅ Дата верна: {item['name']}."
+    elif kind in ("exp", "opd"):
+        pending_cos_date[user_id] = (time.monotonic(), row, "expiry" if kind == "exp" else "opened")
+        what = "«годен до»" if kind == "exp" else "дату вскрытия"
+        await message.reply_text(f"✏️ {item['name']}: напиши {what} цифрами, например 03.2028 или 15.09.2026.")
+        return
+    elif kind == "op":
+        day = (today - timedelta(days=int(extra))).strftime("%d.%m.%Y")
+        await write_to_sheet(message, cos_review_set, item, "opened", day,
+                             f"дата вскрытия примерная, отмечено {today_str}")
+        prefix = f"📅 {item['name']}: открыто примерно {day}."
+    elif kind == "pao":
+        await write_to_sheet(message, cos_review_set, item, "pao", str(int(extra)))
+        prefix = f"✅ {item['name']}: после вскрытия {extra} мес."
+    elif kind == "do":
+        reply, _ = await write_to_sheet(message, apply_cosmetic, item, {"action": action}, today_str)
+        prefix = reply
+    items = await write_to_sheet(message, load_cosmetics)
+    await cos_review_show(message, user_id, items, today, prefix)
+
 
 async def run_cosmetics_reminder(context: ContextTypes.DEFAULT_TYPE):
     """Раз в неделю, в понедельник утром: что пора выбросить или скоро истекает."""
